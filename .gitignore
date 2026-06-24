@@ -1,0 +1,26 @@
+# Binaries
+main
+/costblame
+*.exe
+
+# Database files
+*.db
+*.db-wal
+*.db-shm
+
+# Config with secrets (keep the example, ignore the live copy)
+costblame.yaml
+.env
+
+# Go build cache
+/vendor/
+
+# Code intelligence index (generated locally)
+.codegraph/
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/

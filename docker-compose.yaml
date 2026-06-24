@@ -1,0 +1,96 @@
+services:
+
+  # ── Init container ────────────────────────────────────────────────────────
+  # Runs `costblame migrate` once, applies all SQLite schema migrations, then
+  # exits. The main service waits for this to complete successfully before
+  # starting, ensuring the database is always ready before traffic arrives.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: costblame:local
+    command: ["migrate"]
+    restart: "no"
+    volumes:
+      - db-data:/data
+      - ./costblame.yaml:/app/costblame.yaml:ro
+    environment:
+      COSTBLAME_DATABASE_DSN: /data/costblame.db
+    # healthcheck intentionally omitted — init containers just need to exit 0.
+
+  # ── Main service ──────────────────────────────────────────────────────────
+  costblame:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: costblame:local
+    command: ["serve"]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully  # block until migrations pass
+    ports:
+      # All webhook receivers, the REST API, and the health check share one
+      # port — endpoints appear at /webhooks/<source> for each enabled source.
+      - "${COSTBLAME_PORT:-7890}:8080"
+    volumes:
+      - db-data:/data                              # named volume — shared with init
+      - ./costblame.yaml:/app/costblame.yaml:ro
+    environment:
+      # costblame acts on whichever variables are filled — every integration
+      # below is optional and auto-detected from the environment.
+
+      # Cloud billing credentials for the built-in AWS cost adapter —
+      # use an IAM role / instance profile in production.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+
+      # LLM narratives — set whichever your provider uses (leave all blank
+      # for template narratives; no LLM required).
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OLLAMA_HOST: ${OLLAMA_HOST:-}
+      COSTBLAME_LLM_MODEL: ${COSTBLAME_LLM_MODEL:-}
+
+      # CI/CD deploy sources — filling one in enables its webhook endpoint.
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITLAB_WEBHOOK_SECRET: ${GITLAB_WEBHOOK_SECRET:-}
+      COSTBLAME_SOURCES_ARGOCD_ENABLED: ${COSTBLAME_SOURCES_ARGOCD_ENABLED:-}
+
+      # Alerts — filling one in enables it.
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+      SLACK_CHANNEL: ${SLACK_CHANNEL:-}
+      COSTBLAME_NOTIFY_WEBHOOK_URL: ${COSTBLAME_NOTIFY_WEBHOOK_URL:-}
+
+      # Override the config file's database DSN to use the named volume.
+      COSTBLAME_DATABASE_DSN: /data/costblame.db
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── ngrok (dev profile only) ──────────────────────────────────────────────
+  # Exposes the local webhook receiver to your CI/CD system over a public
+  # tunnel. Only starts with: docker compose --profile dev up
+  ngrok:
+    image: ngrok/ngrok:alpine
+    profiles: ["dev"]
+    command: http costblame:8080 --log stdout
+    ports:
+      - "4040:4040"   # ngrok web inspector UI
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+    depends_on:
+      costblame:
+        condition: service_healthy
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+# db-data persists the SQLite file across container restarts and is shared
+# between the migrate init container and the main costblame service.
+volumes:
+  db-data:

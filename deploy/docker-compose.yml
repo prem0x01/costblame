@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  costblame:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: costblame
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # AWS — required
+      - COSTBLAME_AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      # GitHub — required for webhook receipt
+      - COSTBLAME_GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
+      - COSTBLAME_GITHUB_TOKEN=${GITHUB_TOKEN}
+      # Anthropic — optional (falls back to template narratives)
+      - COSTBLAME_ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - COSTBLAME_ANTHROPIC_MODEL=claude-sonnet-4-6
+      # Slack — optional
+      - COSTBLAME_SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
+      - COSTBLAME_SLACK_CHANNEL=${SLACK_CHANNEL:-#cost-alerts}
+      - COSTBLAME_SLACK_MIN_CONFIDENCE=0.65
+      # Storage
+      - COSTBLAME_DATABASE_DRIVER=sqlite
+      - COSTBLAME_DATABASE_DSN=/data/costblame.db
+      # Tuning
+      - COSTBLAME_AWS_POLL_INTERVAL=15m
+      - COSTBLAME_AWS_ANOMALY_MIN_DELTA_PCT=20
+      - COSTBLAME_CORRELATION_LOOKBACK_WINDOW=72h
+      - COSTBLAME_CORRELATION_HIGH_CONFIDENCE_THRESHOLD=0.65
+    volumes:
+      - costblame_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  costblame_data:
+    driver: local

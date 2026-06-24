@@ -1,0 +1,99 @@
+# costblame.yaml — example configuration
+# Copy to costblame.yaml and fill in your values.
+#
+# Every field can also be set via environment variables:
+#   COSTBLAME_<SECTION>_<KEY>   e.g. COSTBLAME_LLM_API_KEY,
+#                               COSTBLAME_SOURCES_GITHUB_WEBHOOK_SECRET
+# Environment variables take precedence over this file.
+#
+# costblame is provider-agnostic: each section picks an adapter via `provider`
+# (or by which sub-sections you fill in). Don't see your provider? Adapters are
+# small Go interfaces — see "Extending costblame" in the README.
+
+# ──────────────────────────────────────────────
+# HTTP server (REST API + webhook receiver)
+# ──────────────────────────────────────────────
+server:
+  host: 0.0.0.0
+  port: 8080
+
+# ──────────────────────────────────────────────
+# Storage
+# ──────────────────────────────────────────────
+database:
+  driver: sqlite          # sqlite (built-in)
+  dsn: costblame.db       # file path for sqlite
+
+# ──────────────────────────────────────────────
+# Cloud billing source (anomaly detection input)
+# ──────────────────────────────────────────────
+cost:
+  provider: aws           # built-in: aws — implement collect.CostSource to add more
+  poll_interval: 15m
+  lookback_days: 30       # baseline window for z-score anomaly detection
+  anomaly_min_delta_pct: 20.0   # ignore spikes smaller than this
+
+  # Settings for the AWS Cost Explorer adapter (only read when provider: aws).
+  aws:
+    region: us-east-1     # Cost Explorer is a global API served from us-east-1
+    granularity: DAILY    # DAILY or HOURLY
+
+# ──────────────────────────────────────────────
+# Deploy event sources (CI/CD)
+#
+# Filling in a source enables it — leave it empty to disable. Each enabled
+# source gets a webhook endpoint at POST /webhooks/<name>. Conventional env
+# vars also work: GITHUB_WEBHOOK_SECRET, GITHUB_TOKEN, GITLAB_WEBHOOK_SECRET.
+# ──────────────────────────────────────────────
+sources:
+  # GitHub Actions. Mounted at POST /webhooks/github.
+  github:
+    webhook_secret: "changeme"
+    token: ""             # optional — enables PR metadata + changed-file enrichment
+    # poll_interval: 5m   # non-zero switches to API polling instead of webhooks
+
+  # GitLab CI pipeline events. Mounted at POST /webhooks/gitlab.
+  gitlab:
+    webhook_secret: ""    # validates the X-Gitlab-Token header
+
+  # ArgoCD application sync events. Mounted at POST /webhooks/argocd.
+  # ArgoCD webhooks carry no secret — explicit opt-in; protect the endpoint
+  # at the network level.
+  argocd:
+    enabled: false
+
+# ──────────────────────────────────────────────
+# AI narratives (optional — costblame runs fine without an LLM)
+#
+# Leave provider empty to auto-detect from the environment:
+#   ANTHROPIC_API_KEY → anthropic     OPENAI_API_KEY / OPENAI_BASE_URL → openai
+#   OLLAMA_HOST → ollama              none of them → template narratives
+# ──────────────────────────────────────────────
+llm:
+  provider: ""            # anthropic | openai | ollama | none | "" (auto)
+  api_key: ""             # or the provider's conventional env var
+  model: ""               # empty uses the provider's default model
+  base_url: ""            # any OpenAI-compatible endpoint — local or hosted
+                          # (Ollama, vLLM, LM Studio, Groq, Mistral, OpenRouter, …)
+
+# ──────────────────────────────────────────────
+# Alert destinations (every configured destination gets the alert)
+# ──────────────────────────────────────────────
+notify:
+  slack:
+    bot_token: ""         # xoxb-... — leave empty to disable
+    channel: "C0EXAMPLE"  # channel ID, not name
+    min_confidence: 0.65
+
+  # Generic outbound webhook — plug in any chat, incident, or automation tool.
+  webhook:
+    url: ""               # leave empty to disable
+    min_confidence: 0.65
+
+# ──────────────────────────────────────────────
+# Correlation engine
+# ──────────────────────────────────────────────
+correlation:
+  lookback_window: 72h            # how far back to search for causative deploys
+  high_confidence_threshold: 0.65 # narrative + alert above this score
+  min_score_to_store: 0.10        # discard edges below this score
