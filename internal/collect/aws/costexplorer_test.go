@@ -3,6 +3,8 @@ package aws
 import (
 	"context"
 	"fmt"
+	"sort"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,11 +24,22 @@ type fakeCE struct {
 	services []string
 	spend    func(service string, day time.Time) (float64, bool)
 	calls    atomic.Int64
+
+	// Tag-grouped queries (two GroupBy entries: SERVICE + TAG). tagSpend returns,
+	// for a tag key, service and day, the spend per tag value ("" = untagged).
+	tagSpend func(tagKey, service string, day time.Time) map[string]float64
+	tagErr   error
+	tagCalls atomic.Int64
+	tagKeys  []string // the tag keys requested, in order
+	tagMu    sync.Mutex
 }
 
 func (f *fakeCE) GetCostAndUsage(_ context.Context, in *costexplorer.GetCostAndUsageInput,
 	_ ...func(*costexplorer.Options)) (*costexplorer.GetCostAndUsageOutput, error) {
 	f.calls.Add(1)
+	if len(in.GroupBy) == 2 {
+		return f.tagQuery(in)
+	}
 	start, err := time.Parse("2006-01-02", aws.ToString(in.TimePeriod.Start))
 	if err != nil {
 		return nil, err
@@ -53,6 +66,44 @@ func (f *fakeCE) GetCostAndUsage(_ context.Context, in *costexplorer.GetCostAndU
 				End:   aws.String(d.AddDate(0, 0, 1).Format("2006-01-02")),
 			},
 			Groups: groups,
+		})
+	}
+	return &costexplorer.GetCostAndUsageOutput{ResultsByTime: results}, nil
+}
+
+// tagQuery answers a SERVICE + TAG grouped request.
+func (f *fakeCE) tagQuery(in *costexplorer.GetCostAndUsageInput) (*costexplorer.GetCostAndUsageOutput, error) {
+	f.tagCalls.Add(1)
+	tagKey := aws.ToString(in.GroupBy[1].Key)
+	f.tagMu.Lock()
+	f.tagKeys = append(f.tagKeys, tagKey)
+	f.tagMu.Unlock()
+	if f.tagErr != nil {
+		return nil, f.tagErr
+	}
+	start, _ := time.Parse("2006-01-02", aws.ToString(in.TimePeriod.Start))
+	end, _ := time.Parse("2006-01-02", aws.ToString(in.TimePeriod.End))
+
+	var results []cetypes.ResultByTime
+	for d := start; d.Before(end); d = d.AddDate(0, 0, 1) {
+		var groups []cetypes.Group
+		for _, svc := range f.services {
+			values := f.tagSpend(tagKey, svc, d)
+			names := make([]string, 0, len(values))
+			for v := range values {
+				names = append(names, v)
+			}
+			sort.Strings(names)
+			for _, v := range names {
+				groups = append(groups, cetypes.Group{
+					Keys:    []string{svc, tagKey + "$" + v},
+					Metrics: map[string]cetypes.MetricValue{"UnblendedCost": {Amount: aws.String(fmt.Sprintf("%.2f", values[v]))}},
+				})
+			}
+		}
+		results = append(results, cetypes.ResultByTime{
+			TimePeriod: &cetypes.DateInterval{Start: aws.String(d.Format("2006-01-02")), End: aws.String(d.AddDate(0, 0, 1).Format("2006-01-02"))},
+			Groups:     groups,
 		})
 	}
 	return &costexplorer.GetCostAndUsageOutput{ResultsByTime: results}, nil

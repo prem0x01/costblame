@@ -493,6 +493,7 @@ func buildCostSource(ctx context.Context, cfg config.CostConfig) (collect.CostSo
 				SameWeekday:   cfg.SameWeekdayBaseline,
 				SigmaFloorUSD: cfg.SigmaFloorUSD,
 			},
+			cfg.AWS.TagKeys,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("aws cost source: %w", err)

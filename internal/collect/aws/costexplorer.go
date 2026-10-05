@@ -32,12 +32,16 @@ type CESource struct {
 	granularity  cetypes.Granularity
 	lookbackDays int
 	detector     Detector
+	tagKeys      map[string]string // scorer role (team/env) -> AWS tag key; empty disables tag attribution
 }
 
 // NewCESource constructs a CESource using the default AWS credential chain.
 // detector's settings are validated here so a bad value fails at startup.
-func NewCESource(ctx context.Context, region string, granularity string, lookbackDays int, detector Detector) (*CESource, error) {
+func NewCESource(ctx context.Context, region string, granularity string, lookbackDays int, detector Detector, tagKeys map[string]string) (*CESource, error) {
 	if err := detector.validate(lookbackDays); err != nil {
+		return nil, err
+	}
+	if err := validateTagKeys(tagKeys); err != nil {
 		return nil, err
 	}
 	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
@@ -58,6 +62,7 @@ func NewCESource(ctx context.Context, region string, granularity string, lookbac
 		granularity:  gran,
 		lookbackDays: lookbackDays,
 		detector:     detector,
+		tagKeys:      tagKeys,
 	}, nil
 }
 
@@ -146,6 +151,7 @@ func (s *CESource) Collect(ctx context.Context, from, to time.Time) ([]models.Co
 		slog.Debug("aws: services with too little history to judge, not flagged",
 			"services", learning, "min_history_days", s.detector.MinHistory)
 	}
+	s.attributeTags(ctx, from, to, snapshots)
 	return snapshots, nil
 }
 
@@ -182,8 +188,7 @@ func (s *CESource) fetchCosts(ctx context.Context, from, to time.Time) ([]ceRow,
 					continue
 				}
 				svc := group.Keys[0]
-				amountStr := aws.ToString(group.Metrics["UnblendedCost"].Amount)
-				amount, _ := strconv.ParseFloat(amountStr, 64)
+				amount := parseAmount(group.Metrics["UnblendedCost"].Amount)
 				rows = append(rows, ceRow{
 					day:     parseBucketStart(result.TimePeriod),
 					service: svc,
@@ -244,6 +249,13 @@ func buildSeries(rows []ceRow, from, to time.Time, daily bool) map[string][]obse
 		}
 	}
 	return out
+}
+
+// parseAmount reads a Cost Explorer amount string; a missing or malformed
+// value counts as zero.
+func parseAmount(amount *string) float64 {
+	v, _ := strconv.ParseFloat(aws.ToString(amount), 64)
+	return v
 }
 
 func buildTotalMap(rows []ceRow) map[string]float64 {

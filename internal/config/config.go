@@ -87,6 +87,13 @@ type CostConfig struct {
 type AWSCostConfig struct {
 	Region      string `mapstructure:"region"`
 	Granularity string `mapstructure:"granularity"` // "DAILY" or "HOURLY"
+	// TagKeys maps the roles the scorer understands (team, env) to the cost
+	// allocation tag keys used in your AWS account, e.g. {team: Team, env:
+	// Environment}. When set, each anomalous service is annotated with the tag
+	// value whose spend rose most, at the cost of one extra Cost Explorer call
+	// per role per poll while an anomaly exists. The tags must be activated as
+	// cost allocation tags in the Billing console. YAML only; empty disables it.
+	TagKeys map[string]string `mapstructure:"tag_keys"`
 }
 
 // SourcesConfig configures deploy event sources. Each filled-in sub-section

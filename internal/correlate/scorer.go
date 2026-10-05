@@ -187,44 +187,34 @@ func (s *Scorer) serviceScore(anomaly models.CostSnapshot, deploy models.DeployE
 	}
 }
 
-// tagScore compares the anomaly's resource tags against the deploy's team/env metadata.
-// When the anomaly has no tags to compare, the factor is skipped (weight 0): unknown
-// is not evidence for or against, and Score rescales the other weights.
+// tagScore compares the anomaly's team and env tags with the deploy (see
+// tagEvidence). It is skipped (weight 0) when there is nothing to compare: no
+// tags, tags that are not team/env, or a deploy whose environment and team
+// cannot be told. Unknown is not evidence for or against, and Score rescales the
+// other weights.
 func (s *Scorer) tagScore(anomaly models.CostSnapshot, deploy models.DeployEvent) models.ConfidenceFactor {
-	skipped := models.ConfidenceFactor{
-		Name: "tag_match", Score: 0, Weight: 0,
-		Reason: "no team/env allocation tags on the anomaly — factor not applied, other weights rescaled",
+	skipped := func(why string) models.ConfidenceFactor {
+		return models.ConfidenceFactor{
+			Name: "tag_match", Score: 0, Weight: 0,
+			Reason: why + " — factor not applied, other weights rescaled",
+		}
 	}
 	if len(anomaly.Tags) == 0 {
-		return skipped
+		return skipped("no team/env allocation tags on the anomaly")
+	}
+	if anomaly.Tags["team"] == "" && anomaly.Tags["env"] == "" {
+		return skipped("the anomaly's tags include no team or env tag")
 	}
 
-	matches, checks := 0, 0
-
-	if team := anomaly.Tags["team"]; team != "" {
-		checks++
-		if strings.EqualFold(team, deploy.PRTeam) || strings.EqualFold(team, repoToTeam(deploy.Repository)) {
-			matches++
-		}
-	}
-
-	if env := anomaly.Tags["env"]; env != "" {
-		checks++
-		if strings.EqualFold(env, deploy.Environment) {
-			matches++
-		}
-	}
-
+	matches, checks, reason := tagEvidence(anomaly.Tags, deploy)
 	if checks == 0 {
-		return skipped // tags exist but none of them is a team or env tag
+		return skipped("the deploy's environment and team cannot be compared with the anomaly's tags")
 	}
-	score := float64(matches) / float64(checks)
-
 	return models.ConfidenceFactor{
 		Name:   "tag_match",
-		Score:  score,
+		Score:  float64(matches) / float64(checks),
 		Weight: weightTag,
-		Reason: fmt.Sprintf("%d/%d resource tags matched", matches, checks),
+		Reason: fmt.Sprintf("%d/%d tags matched (%s)", matches, checks, reason),
 	}
 }
 
@@ -239,19 +229,4 @@ func (s *Scorer) historicalScore(ctx context.Context, anomaly models.CostSnapsho
 		Weight: weightHistorical,
 		Reason: fmt.Sprintf("%d prior confirmed blame(s) for %s on %s", count, deploy.PRAuthor, anomaly.Service),
 	}
-}
-
-// repoToTeam extracts a simple team slug from "org/team-service" style repo names.
-// e.g. "acme/payments-api" → "payments".
-func repoToTeam(repo string) string {
-	parts := strings.SplitN(repo, "/", 2)
-	if len(parts) < 2 {
-		return repo
-	}
-	name := parts[1]
-	// Strip common suffixes: -api, -service, -worker, -backend
-	for _, suffix := range []string{"-api", "-service", "-worker", "-backend", "-server"} {
-		name = strings.TrimSuffix(name, suffix)
-	}
-	return name
 }

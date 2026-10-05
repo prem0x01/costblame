@@ -232,13 +232,32 @@ Every `(anomaly, deployment)` pair is scored by four independent factors. The we
 | `tag_match` | **20%** | Compares cost allocation tags (`team`, `env`) on the anomaly against the deployment's repository and environment metadata. **Skipped when the anomaly has no such tags** |
 | `historical_pattern` | **10%** | Boosts the score if the same author has caused *confirmed* cost spikes on the same service before (capped at 4 prior incidents) |
 
-**When a factor can't be evaluated it is skipped, not guessed.** Cost Explorer results carry no allocation tags yet, so by default `tag_match` is skipped and the other three weights are rescaled to sum to 100% (temporal 50%, service 37.5%, history 12.5%). Each blame edge shows the effective weights, so the numbers always add up to the score. An earlier version scored the missing tags as a neutral 0.5, which quietly added a fixed 0.10 to every score and capped the maximum at 0.90. Without a service match the best possible score is 0.625, so alerts still require evidence that the deploy touches the spiking service.
+**When a factor can't be evaluated it is skipped, not guessed.** Cost Explorer results carry no allocation tags unless you ask for them (see below), so by default `tag_match` is skipped and the other three weights are rescaled to sum to 100% (temporal 50%, service 37.5%, history 12.5%). Each blame edge shows the effective weights, so the numbers always add up to the score. An earlier version scored the missing tags as a neutral 0.5, which quietly added a fixed 0.10 to every score and capped the maximum at 0.90. Independently of the score, **an alert always requires a service match**: timing, tags and author history can add up to the threshold on their own (a prod deploy by a repeat offender from the right team, in the right hour), but then nothing links the deploy to the service that spiked. Such a candidate is stored as `pending`, and if another candidate has a service match and clears the threshold, that one is alerted instead.
+
+#### Turning on `tag_match`
+
+1. In the AWS Billing console, activate your team and environment tags as **cost allocation tags** (Billing → Cost allocation tags). Cost Explorer only returns tags that are activated, and only for usage after activation.
+2. Tell costblame which AWS tag keys hold the team and the environment:
+
+```yaml
+cost:
+  aws:
+    tag_keys:
+      team: Team            # the scorer role -> your AWS tag key
+      env: Environment
+```
+
+When an anomaly is detected, costblame asks Cost Explorer which tag value the extra spend came from (the value whose spend *rose* the most, not the biggest spender) and records it on the anomaly as `team` / `env`. If the increase is mostly untagged spend, no tag is recorded: an unknown owner stays unknown.
+
+The tags are then compared with the deploy, forgiving spelling: **environment** is read as a class, so `Production`, `prod`, `prd`, `live` and `payments-prod` are all production, while `preprod`, `pre-production` and `non-prod` are staging. It is compared only when both sides name a recognisable environment; an ArgoCD namespace such as `payments`, or `unknown`, means "can't tell" and is skipped, not counted as a mismatch. A staging deploy blamed for production spend *is* a real mismatch and scores against the deploy. **Team** only corroborates: the tag is matched against the repository's name (`acme/checkout-payments-api` is `checkout-payments`, `checkout` or `payments`) or a team label, and a match counts in the deploy's favour, but a team that doesn't match is not held against it, since teams don't always name their repositories after themselves. If nothing can be compared, the factor is skipped and the other weights are rescaled, so turning tags on can never cost a correct alert its score through spelling alone. Detection itself is unchanged and stays per service; tags only annotate anomalies, so each service still has one baseline and one snapshot per day.
+
+Cost Explorer allows two `GroupBy` entries, so each role costs **one extra Cost Explorer request per poll while an anomaly exists** (about $0.01 each; none when there is no anomaly). A tag query that fails is logged and ignored, and `tag_match` is skipped as before.
 
 **Thresholds:**
 
 - `score < 0.10` — discarded, not stored
 - `0.10 ≤ score < 0.65` — stored as a `pending` blame edge, no alert
-- `score ≥ 0.65` — narrative generated, alert sent, status set to `resolved`
+- `score ≥ 0.65` **and a service match** — narrative generated, alert sent, status set to `resolved` (one alert per anomaly)
 
 ### Service inference from file paths
 

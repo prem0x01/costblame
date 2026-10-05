@@ -218,3 +218,28 @@ func TestLoad_GitLabTokenAndBaseURL(t *testing.T) {
 		t.Errorf("env overrides not applied: %+v", cfg.Sources.GitLab)
 	}
 }
+
+func TestLoad_AWSTagKeys(t *testing.T) {
+	dir := t.TempDir()
+	yaml := "cost:\n  aws:\n    tag_keys:\n      team: Team\n      env: Environment\n"
+	if err := os.WriteFile(filepath.Join(dir, "costblame.yaml"), []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	chdir(t, dir)
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Cost.AWS.TagKeys; len(got) != 2 || got["team"] != "Team" || got["env"] != "Environment" {
+		t.Errorf("tag_keys = %v", got)
+	}
+
+	chdir(t, t.TempDir())
+	cfg, err = Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Cost.AWS.TagKeys) != 0 {
+		t.Errorf("tag attribution must be off by default, got %v", cfg.Cost.AWS.TagKeys)
+	}
+}

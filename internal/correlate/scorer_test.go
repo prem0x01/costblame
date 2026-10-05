@@ -257,8 +257,10 @@ func TestTagFactor_AppliedWhenTeamOrEnvTagsPresent(t *testing.T) {
 		wantScore float64
 	}{
 		{"team and env both match", map[string]string{"team": "payments", "env": "prod"}, 1.0},
-		{"only the env matches", map[string]string{"team": "billing", "env": "prod"}, 0.5},
-		{"neither matches", map[string]string{"team": "billing", "env": "staging"}, 0},
+		// A team that does not match is not held against the deploy: mapping a
+		// repository name to a team is a heuristic, so team only corroborates.
+		{"the env matches, the team does not: not a veto", map[string]string{"team": "billing", "env": "prod"}, 1.0},
+		{"a real environment mismatch counts against the deploy", map[string]string{"team": "billing", "env": "staging"}, 0},
 		{"a lone matching team tag", map[string]string{"team": "payments"}, 1.0},
 		{"tag keys are matched case-insensitively on values", map[string]string{"team": "PAYMENTS", "env": "Prod"}, 1.0},
 	}

@@ -48,6 +48,13 @@ cost:
   aws:
     region: us-east-1     # Cost Explorer is a global API served from us-east-1
     granularity: DAILY    # DAILY or HOURLY
+    # Optional: attribute each anomaly to the team/env whose spend rose, so the
+    # tag_match score factor can be used (otherwise it is skipped). Needs the tags
+    # activated as cost allocation tags in the Billing console. Costs one extra
+    # Cost Explorer request per role per poll while an anomaly exists. YAML only.
+    # tag_keys:
+    #   team: Team
+    #   env: Environment
 
 # ──────────────────────────────────────────────
 # Deploy event sources (CI/CD)

@@ -13,7 +13,6 @@ import (
 	"path"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/prem0x01/costblame/internal/correlate"
 	"github.com/prem0x01/costblame/pkg/models"
@@ -291,42 +290,12 @@ func cleanPatterns(in []string) []string {
 }
 
 // isProductionEnvironment reports whether a Deployments API environment name
-// looks like production: "production", "prod", "prod-eu", "prod2", "live".
-// It works on whole words, so "preprod", "pre-production", "non-prod" and
-// "nonprod" — all staging in practice — are rejected even though they contain
-// "prod".
+// looks like production: "production", "prod", "prod-eu", "prod2", "live". It
+// uses the same word-by-word reading as the scorer's tag matching, so "preprod",
+// "pre-production", "non-prod" and "staging-production-like" (all staging in
+// practice) are rejected even though they contain "prod".
 func isProductionEnvironment(env string) bool {
-	isProd := false
-	for _, w := range strings.FieldsFunc(strings.ToLower(env), func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
-	}) {
-		if (strings.HasPrefix(w, "pre") || strings.HasPrefix(w, "non")) && strings.Contains(w, "prod") {
-			return false // "preprod", "nonprod", "preproduction"
-		}
-		switch w {
-		case "pre", "non", "staging", "stage", "stg", "dev", "test", "qa", "uat", "sandbox", "preview":
-			return false
-		case "prod", "production", "live":
-			isProd = true
-		default:
-			if rest, ok := strings.CutPrefix(w, "prod"); ok && isDigits(rest) {
-				isProd = true // "prod1", "prod2"
-			}
-		}
-	}
-	return isProd
-}
-
-func isDigits(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
+	return correlate.EnvClass(env) == correlate.EnvProd
 }
 
 func (h *WebhookHandler) verifySignature(sigHeader string, body []byte) bool {
