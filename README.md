@@ -200,9 +200,13 @@ SQLite in WAL mode — chosen deliberately. costblame's write volume (a few rows
 
 The brain. On every poll tick it asks one question: *are there anomalies nobody has blamed yet?* For each one it pulls every deploy in the preceding `lookback_window` (default 72h) and hands each `(anomaly, deploy)` pair to the scorer — a stateless, fully unit-tested function that returns four named factors and their weighted sum (see [Confidence Scoring](#confidence-scoring)). Then it triages by score: below `min_score_to_store` (0.10) the pair is discarded; up to `high_confidence_threshold` (0.65) it's stored as `pending` for humans to browse; at or above 0.65 the engine **acts** — step ❺.
 
+The engine is built to be re-run safely. An edge is identified by its `(anomaly, deploy)` pair (a unique index enforces it), so scoring the same pair twice updates one row instead of inserting another. A still-`pending` edge is refreshed with the new score; an edge that has been alerted, confirmed or dismissed is never overwritten. Anomalies keep being re-scored (at most once every five minutes) for `correlation.rescore_window` (default 24h) after they are first scored, so a deploy webhook that arrives late, or PR enrichment that finally supplies the changed files, can still produce or upgrade a blame. Re-scoring with nothing new writes nothing, and a given anomaly is alerted about once — a stronger candidate that appears later is stored as `pending`, not announced again.
+
 ### ❺ Narrative + alert
 
-For high-confidence edges only, the engine asks the `NarrativeGenerator` for a 2–3 sentence explanation written for a human at 9am: what spiked, by how much, which deploy is implicated, and what to consider doing. The generator is whichever LLM adapter you configured — Anthropic, OpenAI, a local Ollama model, any OpenAI-compatible endpoint — or the built-in template that needs no network calls at all. The result fans out through every configured `notify.Notifier` simultaneously; a failing notifier is logged and skipped, never blocking the others.
+For high-confidence edges only, the engine asks the `NarrativeGenerator` for a 2–3 sentence explanation written for a human at 9am: what spiked, by how much, which deploy is implicated, and what to consider doing. The generator is whichever LLM adapter you configured — Anthropic, OpenAI, a local Ollama model, any OpenAI-compatible endpoint — or the built-in template that needs no network calls at all. The result is sent through every configured `notify.Notifier` in turn; a failing notifier is logged and never stops the others.
+
+Alerts are delivered through an outbox: an edge is only marked as alerted after a notifier accepts it. If delivery fails (Slack is down, the webhook times out), the alert stays queued and is retried every cycle for up to 48 hours instead of being lost, and an anomaly processed twice after a crash does not send twice. Delivery is therefore **at-least-once**: when one of several notifiers fails, the alert is retried and the ones that already succeeded may receive it again.
 
 ### ❻ The feedback loop
 
@@ -359,6 +363,10 @@ costblame tui       # terminal UI (separate terminal)
 costblame report    # print the blame table to stdout
 ```
 
+### Upgrading
+
+`costblame serve` and `costblame migrate` apply schema migrations automatically, each inside a transaction. **Back up the database first** (copy `costblame.db`, including any `-wal`/`-shm` files, or run `sqlite3 costblame.db ".backup costblame.bak"`). Migration `003` merges duplicate blame edges, keeping one that a human reviewed, and deletes the extra rows; it also backfills alert bookkeeping so alerts that were already handled are not re-sent after the upgrade.
+
 ---
 
 ## CLI Reference
@@ -430,6 +438,7 @@ notify:                         # every configured destination gets the alert
 correlation:
   interval: 1m                  # how often new anomalies are scored (cheap, local)
   lookback_window: 72h
+  rescore_window: 24h           # keep re-scoring an anomaly this long, so late deploys/enrichment count (0 = off)
   high_confidence_threshold: 0.65
   min_score_to_store: 0.10
 ```

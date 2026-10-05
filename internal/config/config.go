@@ -180,6 +180,10 @@ type CorrelationConfig struct {
 	LookbackWindow time.Duration `mapstructure:"lookback_window"`
 	// HighConfidenceThreshold triggers immediate narrative generation and alerting.
 	HighConfidenceThreshold float64 `mapstructure:"high_confidence_threshold"`
+	// RescoreWindow is how long after first scoring an anomaly keeps being
+	// re-scored, so deploys and PR enrichment that arrive late are still weighed.
+	// 0 disables re-scoring.
+	RescoreWindow time.Duration `mapstructure:"rescore_window"`
 	// MinScoreToStore discards edges below this score to keep the DB clean.
 	MinScoreToStore float64 `mapstructure:"min_score_to_store"`
 }
@@ -224,6 +228,7 @@ func Load(cfgFile string) (*Config, error) {
 	v.SetDefault("correlation.lookback_window", "72h")
 	v.SetDefault("correlation.high_confidence_threshold", 0.65)
 	v.SetDefault("correlation.min_score_to_store", 0.10)
+	v.SetDefault("correlation.rescore_window", "24h")
 
 	v.SetEnvPrefix("COSTBLAME")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))

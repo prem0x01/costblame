@@ -114,5 +114,6 @@ notify:
 correlation:
   interval: 1m                    # how often the engine scores new anomalies (cheap, local)
   lookback_window: 72h            # how far back to search for causative deploys
+  rescore_window: 24h             # keep re-scoring an anomaly this long, so late deploys/enrichment count (0 = off)
   high_confidence_threshold: 0.65 # narrative + alert above this score
   min_score_to_store: 0.10        # discard edges below this score

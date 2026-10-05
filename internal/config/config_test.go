@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // chdir switches the working directory for one test (testing.T.Chdir needs Go 1.24;
@@ -145,4 +146,24 @@ func TestLoad_AnomalyDetectionSettings(t *testing.T) {
 			t.Errorf("env overrides not applied: %+v", c)
 		}
 	})
+}
+
+func TestLoad_RescoreWindow(t *testing.T) {
+	chdir(t, t.TempDir())
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Correlation.RescoreWindow; got != 24*time.Hour {
+		t.Errorf("default rescore_window = %v, want 24h", got)
+	}
+
+	t.Setenv("COSTBLAME_CORRELATION_RESCORE_WINDOW", "6h")
+	cfg, err = Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Correlation.RescoreWindow; got != 6*time.Hour {
+		t.Errorf("rescore_window from env = %v, want 6h", got)
+	}
 }

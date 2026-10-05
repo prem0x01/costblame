@@ -134,7 +134,7 @@ func serveCmd() *cobra.Command {
 				store, gen, notifier,
 				cfg.Correlation.Interval,
 				cfg.Correlation.MinScoreToStore,
-			)
+			).WithRescoreWindow(cfg.Correlation.RescoreWindow)
 
 			// Start background cost polling.
 			go pollCosts(ctx, costSrc, store, cfg.Cost.PollInterval)

@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -62,23 +63,43 @@ func (s *Store) Migrate(ctx context.Context) error {
 		if err == nil {
 			continue // already applied
 		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("checking migration %s: %w", version, err)
+		}
 
-		sql, err := migrationsFS.ReadFile("migrations/" + version)
+		body, err := migrationsFS.ReadFile("migrations/" + version)
 		if err != nil {
 			return err
 		}
 
-		if _, err := s.db.ExecContext(ctx, string(sql)); err != nil {
-			return fmt.Errorf("applying migration %s: %w", version, err)
-		}
-
-		if _, err := s.db.ExecContext(ctx,
-			`INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`,
-			version, time.Now().UTC()); err != nil {
-			return fmt.Errorf("recording migration %s: %w", version, err)
+		// Apply the migration and record it in one transaction, so a failure
+		// leaves the schema exactly as it was and the migration can be retried.
+		if err := s.applyMigration(ctx, version, string(body)); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// applyMigration runs one migration file and records it atomically. SQLite DDL
+// is transactional, so a failing statement rolls back the whole file. Migration
+// files must not contain their own BEGIN/COMMIT.
+func (s *Store) applyMigration(ctx context.Context, version, body string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("applying migration %s: %w", version, err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, body); err != nil {
+		return fmt.Errorf("applying migration %s: %w", version, err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`,
+		version, time.Now().UTC()); err != nil {
+		return fmt.Errorf("recording migration %s: %w", version, err)
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -160,6 +181,25 @@ func (s *Store) UnscoredAnomalies(ctx context.Context) ([]models.CostSnapshot, e
 		FROM cost_snapshots
 		WHERE is_anomaly = 1 AND scored_at IS NULL
 		ORDER BY period_start DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanSnapshots(rows)
+}
+
+// RecentlyScoredAnomalies returns anomalies the engine first scored at or after
+// since. The engine re-scores these so a deploy or enrichment that arrives after
+// the first pass is still considered.
+func (s *Store) RecentlyScoredAnomalies(ctx context.Context, since time.Time) ([]models.CostSnapshot, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, collected_at, period_start, period_end,
+		       source, service, region, tags,
+		       amount_usd, prev_amount_usd, delta_usd, delta_pct,
+		       is_anomaly, anomaly_score, granularity
+		FROM cost_snapshots
+		WHERE is_anomaly = 1 AND scored_at IS NOT NULL AND scored_at >= ?
+		ORDER BY period_start DESC`, since.UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -254,6 +294,13 @@ func (s *Store) DeploysBetween(ctx context.Context, from, to time.Time) ([]model
 
 // --- BlameEdge ---
 
+// SaveBlameEdges writes edges in one transaction and is idempotent: an edge is
+// identified by its (cost snapshot, deploy) pair. A pair that already exists is
+// left alone if a human or the alert path has moved it past "pending"; a
+// still-pending edge is refreshed with the new score, factors and (if it is
+// being promoted) status and narrative. That lets a later scoring pass improve a
+// stale candidate (say, after PR enrichment arrives) without ever overwriting a
+// reviewed or already-alerted edge, or creating a duplicate.
 func (s *Store) SaveBlameEdges(ctx context.Context, edges []models.BlameEdge) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -262,20 +309,29 @@ func (s *Store) SaveBlameEdges(ctx context.Context, edges []models.BlameEdge) er
 	defer tx.Rollback()
 
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT OR IGNORE INTO blame_edges
+		INSERT INTO blame_edges
 			(id, cost_snapshot_id, deploy_event_id, confidence_score,
 			 confidence_factors, narrative, status, created_at)
-		VALUES (?,?,?,?,?,?,?,?)`)
+		VALUES (?,?,?,?,?,?,?,?)
+		ON CONFLICT(cost_snapshot_id, deploy_event_id) DO UPDATE SET
+			confidence_score   = excluded.confidence_score,
+			confidence_factors = excluded.confidence_factors,
+			narrative          = CASE WHEN excluded.narrative != '' THEN excluded.narrative ELSE blame_edges.narrative END,
+			status             = excluded.status
+		WHERE blame_edges.status = 'pending'`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
 	for _, e := range edges {
-		factors, _ := json.Marshal(e.ConfidenceFactors)
+		factors, err := json.Marshal(e.ConfidenceFactors)
+		if err != nil {
+			return err
+		}
 		_, err = stmt.ExecContext(ctx,
 			e.ID.String(), e.CostSnapshotID.String(), e.DeployEventID.String(),
-			e.ConfidenceScore, string(factors), e.Narrative, string(e.Status), e.CreatedAt,
+			e.ConfidenceScore, string(factors), e.Narrative, string(e.Status), e.CreatedAt.UTC(),
 		)
 		if err != nil {
 			return err
@@ -284,14 +340,25 @@ func (s *Store) SaveBlameEdges(ctx context.Context, edges []models.BlameEdge) er
 	return tx.Commit()
 }
 
-func (s *Store) UpdateBlameEdge(ctx context.Context, edge models.BlameEdge) error {
-	factors, _ := json.Marshal(edge.ConfidenceFactors)
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE blame_edges
-		SET narrative = ?, status = ?, confidence_score = ?, confidence_factors = ?
-		WHERE id = ?`,
-		edge.Narrative, string(edge.Status), edge.ConfidenceScore, string(factors), edge.ID.String(),
-	)
+// UnalertedEdges returns resolved edges whose alert has not been delivered yet
+// and that were created at or after since. It is the alert outbox: the engine
+// delivers these and calls MarkEdgeAlerted on success, so a failed delivery is
+// retried on the next cycle instead of being lost.
+func (s *Store) UnalertedEdges(ctx context.Context, since time.Time) ([]models.BlameEdge, error) {
+	rows, err := s.db.QueryContext(ctx, blameEdgeSelectJoined+`
+		WHERE be.status = 'resolved' AND be.alerted_at IS NULL AND be.created_at >= ?
+		ORDER BY be.created_at ASC`, since.UTC())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanBlameEdgesWithJoins(rows)
+}
+
+// MarkEdgeAlerted records that an edge's alert was delivered.
+func (s *Store) MarkEdgeAlerted(ctx context.Context, id uuid.UUID) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE blame_edges SET alerted_at = ? WHERE id = ?`, time.Now().UTC(), id.String())
 	return err
 }
 
