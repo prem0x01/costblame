@@ -233,8 +233,8 @@ func (s *Store) CostSnapshotsByService(ctx context.Context, service string, from
 // --- DeployEvent ---
 
 // UpsertDeployEvent inserts a deploy event, or merges it into the existing row
-// with the same ID. Merging only ever fills blanks: a value already stored is
-// never overwritten, so enrichment is additive and the order events arrive in
+// with the same ID. Merging only ever fills blanks (and unions the inferred
+// services): a value already stored is never overwritten, so enrichment is additive and the order events arrive in
 // (raw before enriched, or two workflows for one commit) does not matter. The
 // one exception is occurred_at, which keeps the EARLIEST time — the first
 // moment the code landed. Moving it forward would let a nightly scheduled run
@@ -265,7 +265,18 @@ func (s *Store) UpsertDeployEvent(ctx context.Context, e models.DeployEvent) err
 			pr_team           = COALESCE(NULLIF(deploy_events.pr_team, ''), excluded.pr_team),
 			pr_labels         = CASE WHEN deploy_events.pr_labels IN ('', '[]', 'null') THEN excluded.pr_labels ELSE deploy_events.pr_labels END,
 			changed_files     = CASE WHEN deploy_events.changed_files IN ('', '[]', 'null') THEN excluded.changed_files ELSE deploy_events.changed_files END,
-			inferred_services = CASE WHEN deploy_events.inferred_services IN ('', '[]', 'null') THEN excluded.inferred_services ELSE deploy_events.inferred_services END,
+			-- Services are evidence, and different sources add different evidence (a
+			-- repository rule at ingestion, files after enrichment), so they are
+			-- merged as a union rather than first-writer-wins.
+			inferred_services = CASE
+				WHEN deploy_events.inferred_services IN ('', '[]', 'null') THEN excluded.inferred_services
+				WHEN excluded.inferred_services IN ('', '[]', 'null') THEN deploy_events.inferred_services
+				ELSE (SELECT json_group_array(value) FROM (
+					SELECT value FROM json_each(deploy_events.inferred_services)
+					UNION
+					SELECT value FROM json_each(excluded.inferred_services)
+					ORDER BY value))
+			END,
 			environment       = CASE WHEN deploy_events.environment IN ('', 'unknown') THEN excluded.environment ELSE deploy_events.environment END,
 			raw_payload       = CASE WHEN deploy_events.raw_payload IN ('', '{}') THEN excluded.raw_payload ELSE deploy_events.raw_payload END`,
 		// UTC so the text comparison behind MIN() and DeploysBetween() is

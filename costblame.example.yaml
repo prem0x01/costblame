@@ -71,6 +71,8 @@ sources:
   # GitLab CI pipeline events. Mounted at POST /webhooks/gitlab.
   gitlab:
     webhook_secret: ""    # validates the X-Gitlab-Token header
+    token: ""             # optional, read_api — fetches each commit's changed files (or GITLAB_TOKEN)
+    base_url: https://gitlab.com   # set for self-managed GitLab
 
   # ArgoCD application sync events. Mounted at POST /webhooks/argocd.
   # Opt-in, and a token is required: configure ArgoCD's webhook notification
@@ -115,5 +117,16 @@ correlation:
   interval: 1m                    # how often the engine scores new anomalies (cheap, local)
   lookback_window: 72h            # how far back to search for causative deploys
   rescore_window: 24h             # keep re-scoring an anomaly this long, so late deploys/enrichment count (0 = off)
+
+  # Which cloud services a deploy affects, for sources that cannot list changed files
+  # (ArgoCD always; GitHub/GitLab without a token). A deploy with no service match
+  # cannot reach the alert threshold. Names can be Cost Explorer display names,
+  # product codes or short names ("AWS Lambda", AWSLambda, lambda). YAML only.
+  # service_map:
+  #   - match: acme/payments-api      # repo path, ArgoCD app name or repo URL; * matches anything
+  #     services: [AWS Lambda, DynamoDB]
+  # path_patterns:                    # extra file-path rules, checked before the built-in ones
+  #   - pattern: services/billing/
+  #     service: DynamoDB
   high_confidence_threshold: 0.65 # narrative + alert above this score
   min_score_to_store: 0.10        # discard edges below this score

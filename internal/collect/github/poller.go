@@ -86,7 +86,7 @@ func (p *Poller) poll(ctx context.Context) {
 			event.RawPayload = raw
 
 			// Enrich inline for the poller — latency is less critical.
-			e := newEnricher(p.token)
+			e := newEnricher(p.token, nil)
 			enriched, err := e.Enrich(ctx, event, prHint(run))
 			if err != nil {
 				slog.Warn("github poller: enrichment failed", "err", err)

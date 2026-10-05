@@ -31,6 +31,7 @@ type WebhookHandler struct {
 	workflows []string // deploy workflow name/path patterns; empty = any workflow
 	events    chan models.DeployEvent
 	enricher  *enricher // nil without a token: PR enrichment is off
+	sm        *correlate.ServiceMap
 }
 
 // NewWebhookHandler creates a handler that validates HMAC signatures using secret.
@@ -38,14 +39,17 @@ type WebhookHandler struct {
 // without one, events are stored with no PR metadata. deployWorkflows restricts
 // which workflows count as deploys (matched case-insensitively, with `*` globs,
 // against the workflow's name and file path); empty accepts any workflow.
-func NewWebhookHandler(secret, ghToken string, deployWorkflows []string) *WebhookHandler {
+// serviceMap (may be nil) assigns services by repository, so deploys can match a
+// spiking service even without a token, when no changed files are known.
+func NewWebhookHandler(secret, ghToken string, deployWorkflows []string, serviceMap *correlate.ServiceMap) *WebhookHandler {
 	h := &WebhookHandler{
 		secret:    []byte(secret),
 		workflows: cleanPatterns(deployWorkflows),
 		events:    make(chan models.DeployEvent, 256),
+		sm:        serviceMap,
 	}
 	if ghToken != "" {
-		h.enricher = newEnricher(ghToken)
+		h.enricher = newEnricher(ghToken, serviceMap)
 	}
 	return h
 }
@@ -157,6 +161,9 @@ func (h *WebhookHandler) handleDeploymentStatus(body []byte) int {
 // token is configured, starts background PR enrichment. It returns 202, or 503
 // when the queue is full.
 func (h *WebhookHandler) dispatch(event models.DeployEvent, prHint int) int {
+	// A repository rule gives a service match straight away, and without a token.
+	event.InferredServices = correlate.UnionServices(event.InferredServices, h.sm.ForKeys(event.Repository))
+
 	select {
 	case h.events <- event:
 	default:
@@ -366,14 +373,18 @@ func inferEnvironment(branch string) string {
 
 // enricher fetches PR metadata and changed files from the GitHub REST API.
 type enricher struct {
-	token  string
-	client *http.Client
+	token   string
+	client  *http.Client
+	baseURL string // GitHub API root; overridable for tests and GitHub Enterprise
+	sm      *correlate.ServiceMap
 }
 
-func newEnricher(token string) *enricher {
+func newEnricher(token string, sm *correlate.ServiceMap) *enricher {
 	return &enricher{
-		token:  token,
-		client: &http.Client{Timeout: 20 * time.Second},
+		token:   token,
+		client:  &http.Client{Timeout: 20 * time.Second},
+		baseURL: "https://api.github.com",
+		sm:      sm,
 	}
 }
 
@@ -407,13 +418,15 @@ func (e *enricher) Enrich(ctx context.Context, event models.DeployEvent, prHint 
 	event.PRAuthor = pr.User.Login
 	event.PRLabels = extractLabels(pr.Labels)
 	event.ChangedFiles = files
-	event.InferredServices = correlate.InferServicesFromFiles(files)
+	// Union with what the event already carries (a repository rule): evidence
+	// from files adds to it.
+	event.InferredServices = correlate.UnionServices(event.InferredServices, e.sm.InferFromFiles(files))
 
 	return &event, nil
 }
 
 func (e *enricher) fetchPR(ctx context.Context, repo string, number int) (*PullRequest, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/pulls/%d", repo, number)
+	url := fmt.Sprintf("%s/repos/%s/pulls/%d", e.baseURL, repo, number)
 	var pr PullRequest
 	if err := e.get(ctx, url, &pr); err != nil {
 		return nil, err
@@ -422,7 +435,7 @@ func (e *enricher) fetchPR(ctx context.Context, repo string, number int) (*PullR
 }
 
 func (e *enricher) fetchChangedFiles(ctx context.Context, repo string, prNumber int) ([]string, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/pulls/%d/files?per_page=100", repo, prNumber)
+	url := fmt.Sprintf("%s/repos/%s/pulls/%d/files?per_page=100", e.baseURL, repo, prNumber)
 	var files []File
 	if err := e.get(ctx, url, &files); err != nil {
 		return nil, err
@@ -435,7 +448,7 @@ func (e *enricher) fetchChangedFiles(ctx context.Context, repo string, prNumber 
 }
 
 func (e *enricher) findPRForCommit(ctx context.Context, repo, sha string) (int, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/commits/%s/pulls", repo, sha)
+	url := fmt.Sprintf("%s/repos/%s/commits/%s/pulls", e.baseURL, repo, sha)
 	var prs []PullRequest
 	if err := e.get(ctx, url, &prs); err != nil {
 		return 0, err

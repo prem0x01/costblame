@@ -6,6 +6,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/prem0x01/costblame/internal/correlate"
+	"github.com/prem0x01/costblame/pkg/models"
 )
 
 const syncedApp = `{"metadata":{"name":"payments"},"status":{"operationState":{"phase":"Succeeded"}}}`
@@ -21,7 +24,7 @@ func post(h *WebhookHandler, auth string) *httptest.ResponseRecorder {
 }
 
 func TestServeHTTP_RequiresBearerToken(t *testing.T) {
-	h := New("argo-secret")
+	h := New("argo-secret", nil)
 
 	for name, auth := range map[string]string{
 		"missing header": "",
@@ -38,7 +41,7 @@ func TestServeHTTP_RequiresBearerToken(t *testing.T) {
 }
 
 func TestServeHTTP_AcceptsValidTokenAndEmitsDeploy(t *testing.T) {
-	h := New("argo-secret")
+	h := New("argo-secret", nil)
 
 	if rec := post(h, "Bearer argo-secret"); rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202", rec.Code)
@@ -55,7 +58,7 @@ func TestServeHTTP_AcceptsValidTokenAndEmitsDeploy(t *testing.T) {
 }
 
 func TestServeHTTP_EmptyTokenRejectsEverything(t *testing.T) {
-	h := New("")
+	h := New("", nil)
 	// An empty configured token must not match a request that sends no token.
 	if rec := post(h, ""); rec.Code != http.StatusUnauthorized {
 		t.Errorf("no header = %d, want 401", rec.Code)
@@ -79,7 +82,7 @@ func postBody(h *WebhookHandler, body string) {
 }
 
 func TestSameAppAndRevisionIsOneDeploy(t *testing.T) {
-	h := New("argo-secret")
+	h := New("argo-secret", nil)
 	postBody(h, syncOf("payments", "rev1"))
 	postBody(h, syncOf("payments", "rev1")) // resync / redelivery
 
@@ -98,7 +101,7 @@ func TestSameAppAndRevisionIsOneDeploy(t *testing.T) {
 }
 
 func TestDifferentAppsOrRevisionsAreDifferentDeploys(t *testing.T) {
-	h := New("argo-secret")
+	h := New("argo-secret", nil)
 	postBody(h, syncOf("payments", "rev1"))
 	postBody(h, syncOf("billing", "rev1")) // several apps can share a repo and revision
 	postBody(h, syncOf("payments", "rev2"))
@@ -114,5 +117,53 @@ func TestDifferentAppsOrRevisionsAreDifferentDeploys(t *testing.T) {
 	}
 	if len(seen) != 3 {
 		t.Errorf("distinct (app, revision) pairs produced %d distinct IDs, want 3", len(seen))
+	}
+}
+
+func mapFor(t *testing.T, entries ...correlate.ServiceMapEntry) *correlate.ServiceMap {
+	t.Helper()
+	sm, err := correlate.NewServiceMap(entries, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sm
+}
+
+func firstEvent(t *testing.T, h *WebhookHandler) models.DeployEvent {
+	t.Helper()
+	select {
+	case ev := <-h.ch:
+		return ev
+	case <-timeout():
+		t.Fatal("no deploy event emitted")
+		return models.DeployEvent{}
+	}
+}
+
+// ArgoCD sync events carry no files, author or PR, so a service-map rule is the
+// only way for them to match a spiking service.
+func TestServiceMap_MatchesByApplicationNameRepoURLOrRepoPath(t *testing.T) {
+	cases := map[string]correlate.ServiceMapEntry{
+		"application name": {Match: "payments", Services: []string{"AWS Lambda"}},
+		"owner/repo path":  {Match: "acme/infra", Services: []string{"AWS Lambda"}},
+		"repo URL glob":    {Match: "https://git.example/acme/*", Services: []string{"AWS Lambda"}},
+	}
+	for name, entry := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := New("argo-secret", mapFor(t, entry))
+			postBody(h, syncOf("payments", "rev1"))
+			ev := firstEvent(t, h)
+			if len(ev.InferredServices) != 1 || ev.InferredServices[0] != "AWS Lambda" {
+				t.Errorf("InferredServices = %v, want [AWS Lambda]", ev.InferredServices)
+			}
+		})
+	}
+}
+
+func TestServiceMap_UnmappedApplicationGetsNoServices(t *testing.T) {
+	h := New("argo-secret", mapFor(t, correlate.ServiceMapEntry{Match: "billing", Services: []string{"RDS"}}))
+	postBody(h, syncOf("payments", "rev1"))
+	if ev := firstEvent(t, h); len(ev.InferredServices) != 0 {
+		t.Errorf("an unmapped application must not be assigned services, got %v", ev.InferredServices)
 	}
 }

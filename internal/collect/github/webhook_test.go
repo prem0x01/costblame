@@ -2,6 +2,7 @@ package github
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prem0x01/costblame/internal/correlate"
 	"github.com/prem0x01/costblame/pkg/models"
 )
 
@@ -71,7 +73,7 @@ func drain(h *WebhookHandler) []models.DeployEvent {
 func TestVerifySignature(t *testing.T) {
 	body := []byte(`{"action":"completed"}`)
 
-	h := NewWebhookHandler("s3cret", "", nil)
+	h := NewWebhookHandler("s3cret", "", nil, nil)
 	if !h.verifySignature(sign([]byte("s3cret"), body), body) {
 		t.Error("valid signature rejected")
 	}
@@ -83,14 +85,14 @@ func TestVerifySignature(t *testing.T) {
 	}
 
 	// An empty secret must fail closed: anyone can compute an empty-key HMAC.
-	empty := NewWebhookHandler("", "", nil)
+	empty := NewWebhookHandler("", "", nil, nil)
 	if empty.verifySignature(sign(nil, body), body) {
 		t.Error("empty-secret handler accepted a forgeable empty-key signature")
 	}
 }
 
 func TestWorkflowRun_RedeliveryProducesSameEventID(t *testing.T) {
-	h := NewWebhookHandler(testSecret, "", nil)
+	h := NewWebhookHandler(testSecret, "", nil, nil)
 	payload := run(nil)
 
 	for i := 0; i < 2; i++ {
@@ -112,7 +114,7 @@ func TestWorkflowRun_RedeliveryProducesSameEventID(t *testing.T) {
 }
 
 func TestWorkflowRun_SeveralWorkflowsForOneCommitShareAnID(t *testing.T) {
-	h := NewWebhookHandler(testSecret, "", nil) // no filter: every workflow counts
+	h := NewWebhookHandler(testSecret, "", nil, nil) // no filter: every workflow counts
 
 	send(t, h, "workflow_run", run(func(r *WorkflowRun) { r.ID, r.Name = 1, "CI" }))
 	send(t, h, "workflow_run", run(func(r *WorkflowRun) { r.ID, r.Name = 2, "Lint" }))
@@ -130,7 +132,7 @@ func TestWorkflowRun_SeveralWorkflowsForOneCommitShareAnID(t *testing.T) {
 }
 
 func TestWorkflowRun_DifferentCommitsGetDifferentIDs(t *testing.T) {
-	h := NewWebhookHandler(testSecret, "", nil)
+	h := NewWebhookHandler(testSecret, "", nil, nil)
 	send(t, h, "workflow_run", run(nil))
 	send(t, h, "workflow_run", run(func(r *WorkflowRun) { r.HeadSHA = "def456" }))
 
@@ -155,7 +157,7 @@ func TestWorkflowRun_IgnoresNonDeploys(t *testing.T) {
 	}
 	for name, mod := range cases {
 		t.Run(name, func(t *testing.T) {
-			h := NewWebhookHandler(testSecret, "", nil)
+			h := NewWebhookHandler(testSecret, "", nil, nil)
 			if rec := send(t, h, "workflow_run", run(mod)); rec.Code != http.StatusAccepted {
 				t.Fatalf("status = %d, want 202 (acknowledged, ignored)", rec.Code)
 			}
@@ -168,7 +170,7 @@ func TestWorkflowRun_IgnoresNonDeploys(t *testing.T) {
 
 func TestWorkflowRun_AcceptedDeployTriggers(t *testing.T) {
 	for _, trigger := range []string{"push", "workflow_dispatch", "repository_dispatch", "release", "workflow_run"} {
-		h := NewWebhookHandler(testSecret, "", nil)
+		h := NewWebhookHandler(testSecret, "", nil, nil)
 		send(t, h, "workflow_run", run(func(r *WorkflowRun) { r.Event = trigger }))
 		if len(drain(h)) != 1 {
 			t.Errorf("trigger %q should count as a deploy", trigger)
@@ -204,7 +206,7 @@ func TestWorkflowRun_DeployWorkflowFilter(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h := NewWebhookHandler(testSecret, "", tc.patterns)
+			h := NewWebhookHandler(testSecret, "", tc.patterns, nil)
 			send(t, h, "workflow_run", run(tc.mod))
 			if got := len(drain(h)) == 1; got != tc.want {
 				t.Errorf("deploy = %v, want %v", got, tc.want)
@@ -223,7 +225,7 @@ func deploymentStatus(state, env, sha string) DeploymentStatusPayload {
 }
 
 func TestDeploymentStatus_SuccessfulProductionDeploy(t *testing.T) {
-	h := NewWebhookHandler(testSecret, "", nil)
+	h := NewWebhookHandler(testSecret, "", nil, nil)
 	if rec := send(t, h, "deployment_status", deploymentStatus("success", "production", "abc123")); rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202", rec.Code)
 	}
@@ -260,7 +262,7 @@ func TestDeploymentStatus_Ignored(t *testing.T) {
 	}
 	for name, p := range cases {
 		t.Run(name, func(t *testing.T) {
-			h := NewWebhookHandler(testSecret, "", nil)
+			h := NewWebhookHandler(testSecret, "", nil, nil)
 			if rec := send(t, h, "deployment_status", p); rec.Code != http.StatusAccepted {
 				t.Fatalf("status = %d, want 202", rec.Code)
 			}
@@ -274,7 +276,7 @@ func TestDeploymentStatus_Ignored(t *testing.T) {
 // A full queue must answer promptly with 503 (so GitHub retries; deterministic
 // IDs make that safe) and must never block the handler.
 func TestFullQueueReturns503WithoutBlocking(t *testing.T) {
-	h := NewWebhookHandler(testSecret, "", nil)
+	h := NewWebhookHandler(testSecret, "", nil, nil)
 	h.events = make(chan models.DeployEvent, 1)
 	h.events <- models.DeployEvent{} // queue is now full
 
@@ -295,23 +297,23 @@ func TestFullQueueReturns503WithoutBlocking(t *testing.T) {
 }
 
 func TestWithoutTokenThereIsNoEnrichment(t *testing.T) {
-	if h := NewWebhookHandler(testSecret, "", nil); h.enricher != nil {
+	if h := NewWebhookHandler(testSecret, "", nil, nil); h.enricher != nil {
 		t.Error("enricher created without a token: it would call the GitHub API with an empty bearer token")
 	}
-	if h := NewWebhookHandler(testSecret, "ghp_x", nil); h.enricher == nil {
+	if h := NewWebhookHandler(testSecret, "ghp_x", nil, nil); h.enricher == nil {
 		t.Error("enricher missing despite a token")
 	}
 }
 
 func TestMalformedSignedPayloadIs400(t *testing.T) {
-	h := NewWebhookHandler(testSecret, "", nil)
+	h := NewWebhookHandler(testSecret, "", nil, nil)
 	if rec := sendRaw(h, "workflow_run", []byte(`{not json`)); rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 }
 
 func TestBadSignatureIs401AndQueuesNothing(t *testing.T) {
-	h := NewWebhookHandler(testSecret, "", nil)
+	h := NewWebhookHandler(testSecret, "", nil, nil)
 	body, _ := json.Marshal(run(nil))
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/github", bytes.NewReader(body))
 	req.Header.Set("X-GitHub-Event", "workflow_run")
@@ -325,7 +327,7 @@ func TestBadSignatureIs401AndQueuesNothing(t *testing.T) {
 }
 
 func TestPingIs200(t *testing.T) {
-	h := NewWebhookHandler(testSecret, "", nil)
+	h := NewWebhookHandler(testSecret, "", nil, nil)
 	if rec := sendRaw(h, "ping", []byte(`{"zen":"x"}`)); rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -341,5 +343,79 @@ func TestIsProductionEnvironment(t *testing.T) {
 		if got := isProductionEnvironment(env); got != want {
 			t.Errorf("isProductionEnvironment(%q) = %v, want %v", env, got, want)
 		}
+	}
+}
+
+func mapFor(t *testing.T, entries ...correlate.ServiceMapEntry) *correlate.ServiceMap {
+	t.Helper()
+	sm, err := correlate.NewServiceMap(entries, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sm
+}
+
+// Without a token nothing is fetched, but a repository rule still gives the
+// deploy a service, so it can reach the alert threshold.
+func TestRepoRuleGivesServicesWithoutAToken(t *testing.T) {
+	h := NewWebhookHandler(testSecret, "", nil, mapFor(t, correlate.ServiceMapEntry{Match: "acme/payments", Services: []string{"AWS Lambda"}}))
+
+	send(t, h, "workflow_run", run(nil)) // repository is Acme/Payments: matching ignores case
+	events := drain(h)
+	if len(events) != 1 || len(events[0].InferredServices) != 1 || events[0].InferredServices[0] != "AWS Lambda" {
+		t.Fatalf("events = %+v, want one carrying [AWS Lambda]", events)
+	}
+
+	send(t, h, "deployment_status", deploymentStatus("success", "production", "abc123"))
+	events = drain(h)
+	if len(events) != 1 || len(events[0].InferredServices) != 1 {
+		t.Errorf("deployment_status events get the repo rule too, got %+v", events)
+	}
+}
+
+func TestRepoRuleDoesNotApplyToOtherRepositories(t *testing.T) {
+	h := NewWebhookHandler(testSecret, "", nil, mapFor(t, correlate.ServiceMapEntry{Match: "acme/billing", Services: []string{"RDS"}}))
+	send(t, h, "workflow_run", run(nil))
+	if events := drain(h); len(events) != 1 || len(events[0].InferredServices) != 0 {
+		t.Errorf("unrelated repo got services: %+v", events)
+	}
+}
+
+// Enrichment adds file evidence on top of the repo rule instead of replacing it.
+func TestEnrichmentUnionsFilesWithTheRepoRule(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/Acme/Payments/pulls/42", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer ghp_test" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"number": 42, "title": "feat: cache", "user": map[string]any{"login": "alice"}})
+	})
+	mux.HandleFunc("/repos/Acme/Payments/pulls/42/files", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]map[string]any{{"filename": "terraform/s3/bucket.tf"}, {"filename": "docs/readme.md"}})
+	})
+	api := httptest.NewServer(mux)
+	defer api.Close()
+
+	sm := mapFor(t, correlate.ServiceMapEntry{Match: "acme/payments", Services: []string{"DynamoDB"}})
+	e := newEnricher("ghp_test", sm)
+	e.baseURL = api.URL
+
+	base := eventFromRun("Acme/Payments", run(nil).WorkflowRun)
+	base.InferredServices = sm.ForKeys(base.Repository)
+
+	got, err := e.Enrich(context.Background(), base, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PRNumber != 42 || got.PRAuthor != "alice" || len(got.ChangedFiles) != 2 {
+		t.Errorf("PR metadata not applied: %+v", got)
+	}
+	have := map[string]bool{}
+	for _, s := range got.InferredServices {
+		have[s] = true
+	}
+	if !have["DynamoDB"] || !have["AmazonS3"] || len(have) != 2 {
+		t.Errorf("services = %v, want the rule's DynamoDB plus S3 from the changed files", got.InferredServices)
 	}
 }

@@ -624,3 +624,55 @@ func TestHistoryCountsAreCachedWithinACycle(t *testing.T) {
 		t.Errorf("history queries in the next cycle = %d, want 1", got)
 	}
 }
+
+// An ArgoCD deploy has no author, PR or files. A service-map rule is its only
+// evidence, and it must be enough to reach the alert tier (0.40 temporal +
+// 0.30 service + 0.10 neutral tags = 0.80).
+func TestMappedArgoCDDeployCanReachTheAlertThreshold(t *testing.T) {
+	env := newEnv(t, 0.2)
+	anomaly := anomalyAt(spike)
+	anomaly.Service = "AWS Lambda" // as Cost Explorer reports it
+	env.seedAnomaly(anomaly)
+
+	sm, err := NewServiceMap([]ServiceMapEntry{{Match: "payments", Services: []string{"lambda"}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := models.DeployEvent{
+		ID: uuid.New(), OccurredAt: spike.Add(-time.Hour), Source: models.DeploySourceArgoCD,
+		Repository: "https://git.example/acme/infra", CommitSHA: "rev1", Status: models.DeployStatusSuccess,
+		InferredServices: sm.ForKeys("payments"), // what the ArgoCD receiver stores; no author, no files
+	}
+	env.seedDeploy(d)
+
+	env.cycle()
+
+	edges := env.edges(anomaly)
+	if len(edges) != 1 || edges[0].ConfidenceScore < HighConfidenceThreshold {
+		t.Fatalf("edges = %+v, want one at or above the %.2f alert threshold", edges, HighConfidenceThreshold)
+	}
+	if len(env.notifier.sent) != 1 {
+		t.Errorf("alerts sent = %d, want 1", len(env.notifier.sent))
+	}
+}
+
+// Without a service match the same ArgoCD deploy tops out at 0.60 and never alerts.
+func TestUnmappedArgoCDDeployCannotAlert(t *testing.T) {
+	env := newEnv(t, 0.2)
+	anomaly := anomalyAt(spike)
+	anomaly.Service = "AWS Lambda"
+	env.seedAnomaly(anomaly)
+	env.seedDeploy(models.DeployEvent{
+		ID: uuid.New(), OccurredAt: spike.Add(-time.Hour), Source: models.DeploySourceArgoCD,
+		Repository: "https://git.example/acme/infra", CommitSHA: "rev1", Status: models.DeployStatusSuccess,
+	})
+
+	env.cycle()
+
+	if len(env.notifier.sent) != 0 {
+		t.Errorf("a deploy with no service evidence alerted (%d)", len(env.notifier.sent))
+	}
+	if edges := env.edges(anomaly); len(edges) != 1 || edges[0].ConfidenceScore >= HighConfidenceThreshold {
+		t.Errorf("expected one stored candidate below the threshold, got %+v", edges)
+	}
+}

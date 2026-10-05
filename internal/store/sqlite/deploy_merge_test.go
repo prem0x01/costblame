@@ -194,3 +194,49 @@ func TestUpsertDeploy_NilSlicesAreStoredAsEmptyArrays(t *testing.T) {
 		t.Errorf("nil slices should round-trip as empty arrays, got %v %v %v", got.PRLabels, got.ChangedFiles, got.InferredServices)
 	}
 }
+
+// Services come from different evidence at different times (a repository rule
+// at ingestion, changed files after enrichment). They must combine.
+func TestUpsertDeploy_InferredServicesAreUnioned(t *testing.T) {
+	cases := []struct {
+		name          string
+		first, second []string
+		want          []string
+	}{
+		{"enrichment adds to a repo rule", []string{"lambda"}, []string{"AmazonS3", "AWSLambda"}, []string{"AWSLambda", "AmazonS3", "lambda"}},
+		{"a raw event does not erase them", []string{"AWSLambda"}, nil, []string{"AWSLambda"}},
+		{"first event empty", nil, []string{"AmazonS3"}, []string{"AmazonS3"}},
+		{"identical sets stay the same", []string{"AWSLambda"}, []string{"AWSLambda"}, []string{"AWSLambda"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+
+			a := mergeEvent()
+			a.InferredServices = tc.first
+			if err := store.UpsertDeployEvent(ctx, a); err != nil {
+				t.Fatal(err)
+			}
+			b := mergeEvent()
+			b.InferredServices = tc.second
+			if err := store.UpsertDeployEvent(ctx, b); err != nil {
+				t.Fatal(err)
+			}
+
+			got := load(t, store).InferredServices
+			if len(got) != len(tc.want) {
+				t.Fatalf("services = %v, want %v", got, tc.want)
+			}
+			have := map[string]bool{}
+			for _, g := range got {
+				have[g] = true
+			}
+			for _, w := range tc.want {
+				if !have[w] {
+					t.Errorf("services = %v, missing %q", got, w)
+				}
+			}
+		})
+	}
+}

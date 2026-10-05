@@ -256,6 +256,38 @@ The default patterns:
 | `k8s/`, `kubernetes/`, `helm/` | managed Kubernetes |
 | `terraform/ec2/`, `terraform/alb/` | VMs / load balancing |
 
+### What each source can tell the scorer
+
+The service match is worth 30% of a score, and **a deploy with no service match cannot reach the 0.65 alert threshold** (its best score is 0.60). So what a source can learn about a deploy decides whether it can ever alert:
+
+| Source | PR / author | Changed files → services | Without extra setup |
+|---|---|---|---|
+| GitHub | PR number, title, author, labels (needs `sources.github.token`) | PR file list (needs the token) | No token: only a `correlation.service_map` rule |
+| GitLab | MR title and author when the pipeline has one; otherwise the pipeline's user, then the commit author | The commit's diff via the API (needs `sources.gitlab.token`, `read_api`) | No token: only a `correlation.service_map` rule |
+| ArgoCD | none — a sync event carries no author or PR | none — a sync event carries no files | Only a `correlation.service_map` rule |
+
+`costblame serve` logs a warning at startup for any enabled source that has neither a token nor a rule, since its deploys would be stored but could never alert.
+
+#### Service map
+
+A service-map rule assigns services to every deploy from a repository or ArgoCD application, whatever it changed. Put it in `costblame.yaml` (it is not available as an environment variable):
+
+```yaml
+correlation:
+  service_map:
+    - match: acme/payments-api        # repository path (GitHub/GitLab), ArgoCD app name, or repo URL
+      services: [AWS Lambda, DynamoDB]
+    - match: acme/data-*              # * matches any run of characters, including "/"; case is ignored
+      services: [s3]
+    - match: payments                 # an ArgoCD application name
+      services: [lambda, RDS]
+  path_patterns:                      # extra file-path rules, checked before the built-in ones
+    - pattern: services/billing/
+      service: DynamoDB
+```
+
+Service names can be written as Cost Explorer display names, product codes or short names — see [service names](#service-inference-from-file-paths) above. For ArgoCD, a rule may match the application name, the repository URL or its `owner/repo` path. Rules combine with what files reveal: a deploy's services are the union of both. Rules that could never match (an empty `match`, no `services`) are rejected at startup.
+
 ---
 
 ## Anatomy of a Blame
@@ -420,6 +452,8 @@ sources:                        # CI/CD adapters — filled in = enabled
     deploy_workflows: []        # e.g. ["Deploy", "release.yml"]; empty = any push-triggered run on main
   gitlab:
     webhook_secret: ""          # set to enable /webhooks/gitlab
+    token: ""                   # optional, read_api — fetches each commit's changed files
+    base_url: https://gitlab.com   # set for self-managed GitLab
   argocd:
     enabled: false              # explicit opt-in
     token: ""                   # required — ArgoCD sends it as "Authorization: Bearer <token>"
@@ -461,7 +495,7 @@ Any YAML key maps to `COSTBLAME_<SECTION>_<KEY>` (dots become underscores): `COS
 | `OLLAMA_HOST` | Narratives via a local Ollama server |
 | `GITHUB_WEBHOOK_SECRET`, `GITHUB_TOKEN` | Enables the GitHub source (secret required; token adds PR enrichment) |
 | `COSTBLAME_SOURCES_GITHUB_DEPLOY_WORKFLOWS` | Comma-separated workflows that count as deploys, e.g. `Deploy,release.yml` |
-| `GITLAB_WEBHOOK_SECRET` | Enables the GitLab source |
+| `GITLAB_WEBHOOK_SECRET`, `GITLAB_TOKEN` | Enables the GitLab source; the token (`read_api`) adds changed-file enrichment |
 | `ARGOCD_WEBHOOK_TOKEN` | Bearer token ArgoCD must send (required to enable the ArgoCD source) |
 | `COSTBLAME_SERVER_API_TOKEN` | Token for the web UI and `/api` (generated at startup if unset) |
 | `SLACK_BOT_TOKEN`, `SLACK_CHANNEL` | Enables Slack alerts |
@@ -542,9 +576,13 @@ Whatever the filter, these are never deploys: `schedule` and `pull_request*` tri
 
 Successful pipelines on `main`/`master`/`release/*`/`deploy/*` branches are treated as deploys.
 
+Set `sources.gitlab.token` (or `GITLAB_TOKEN`) to a token with `read_api` scope, and `sources.gitlab.base_url` for a self-managed instance. Each deploy's changed files are then fetched from the commit's diff (up to 1,000 files) and mapped to services. Without a token, add a [service-map rule](#service-map) or GitLab deploys cannot match a service.
+
 ### Deploy events: ArgoCD
 
 Set `sources.argocd.enabled: true` and `sources.argocd.token` (or `ARGOCD_WEBHOOK_TOKEN`), then point an ArgoCD notification webhook at `https://your-host:7890/webhooks/argocd` with the header `Authorization: Bearer <token>`. Without a token the receiver is not mounted — an open endpoint would let anyone inject fake deploys and frame an author.
+
+A sync event carries no changed files, author or PR, so ArgoCD deploys can only match a service through a [service-map rule](#service-map) on the application name or repository. Without one they are stored as candidates but can never reach the alert threshold.
 
 ### Narratives: any LLM, or none
 

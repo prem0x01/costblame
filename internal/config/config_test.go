@@ -167,3 +167,54 @@ func TestLoad_RescoreWindow(t *testing.T) {
 		t.Errorf("rescore_window from env = %v, want 6h", got)
 	}
 }
+
+func TestLoad_ServiceMapAndPathPatterns(t *testing.T) {
+	dir := t.TempDir()
+	yaml := `
+correlation:
+  service_map:
+    - match: acme/payments-*
+      services: [AWS Lambda, DynamoDB]
+    - match: payments
+      services: [rds]
+  path_patterns:
+    - pattern: services/billing/
+      service: Amazon DynamoDB
+`
+	if err := os.WriteFile(filepath.Join(dir, "costblame.yaml"), []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	chdir(t, dir)
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := cfg.Correlation
+	if len(c.ServiceMap) != 2 || c.ServiceMap[0].Match != "acme/payments-*" || len(c.ServiceMap[0].Services) != 2 || c.ServiceMap[1].Services[0] != "rds" {
+		t.Errorf("service_map = %+v", c.ServiceMap)
+	}
+	if len(c.PathPatterns) != 1 || c.PathPatterns[0].Pattern != "services/billing/" || c.PathPatterns[0].Service != "Amazon DynamoDB" {
+		t.Errorf("path_patterns = %+v", c.PathPatterns)
+	}
+}
+
+func TestLoad_GitLabTokenAndBaseURL(t *testing.T) {
+	chdir(t, t.TempDir())
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Sources.GitLab.BaseURL != "https://gitlab.com" || cfg.Sources.GitLab.Token != "" {
+		t.Errorf("defaults = %+v", cfg.Sources.GitLab)
+	}
+
+	t.Setenv("GITLAB_TOKEN", "glpat-env")
+	t.Setenv("COSTBLAME_SOURCES_GITLAB_BASE_URL", "https://git.corp.example")
+	cfg, err = Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Sources.GitLab.Token != "glpat-env" || cfg.Sources.GitLab.BaseURL != "https://git.corp.example" {
+		t.Errorf("env overrides not applied: %+v", cfg.Sources.GitLab)
+	}
+}
