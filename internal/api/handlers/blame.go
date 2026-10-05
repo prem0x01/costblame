@@ -3,7 +3,9 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -16,8 +18,9 @@ import (
 // BlameStore is the subset of store.Store required by the blame handlers.
 type BlameStore interface {
 	RecentBlameEdges(ctx context.Context, limit int) ([]models.BlameEdge, error)
+	BlameEdgeByID(ctx context.Context, id uuid.UUID) (*models.BlameEdge, error)
 	BlameEdgesBySnapshot(ctx context.Context, snapshotID uuid.UUID) ([]models.BlameEdge, error)
-	UpdateBlameEdge(ctx context.Context, edge models.BlameEdge) error
+	UpdateBlameStatus(ctx context.Context, id uuid.UUID, status models.BlameStatus) error
 	UnblamedAnomalies(ctx context.Context) ([]models.CostSnapshot, error)
 	CostSnapshotsByService(ctx context.Context, service string, from, to time.Time) ([]models.CostSnapshot, error)
 }
@@ -54,11 +57,34 @@ func (h *BlameHandler) ListBlame(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetBlame handles GET /blame/{id}
+// GetBlame handles GET /blame/{id} — {id} is a blame edge ID, the same ID
+// returned by GET /blame and accepted by the confirm/dismiss endpoints.
 func (h *BlameHandler) GetBlame(w http.ResponseWriter, r *http.Request) {
 	id, err := uuidFromPath(r, "id")
 	if err != nil {
 		jsonError(w, "invalid blame edge ID", http.StatusBadRequest)
+		return
+	}
+
+	edge, err := h.store.BlameEdgeByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			jsonError(w, "not found", http.StatusNotFound)
+			return
+		}
+		jsonError(w, "fetching blame edge", http.StatusInternalServerError)
+		return
+	}
+
+	jsonOK(w, map[string]any{"blame_edge": edge})
+}
+
+// ListBlameForAnomaly handles GET /anomalies/{id}/blame — {id} is a cost
+// snapshot ID; returns every candidate edge for that anomaly, best first.
+func (h *BlameHandler) ListBlameForAnomaly(w http.ResponseWriter, r *http.Request) {
+	id, err := uuidFromPath(r, "id")
+	if err != nil {
+		jsonError(w, "invalid anomaly ID", http.StatusBadRequest)
 		return
 	}
 
@@ -68,12 +94,7 @@ func (h *BlameHandler) GetBlame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(edges) == 0 {
-		jsonError(w, "not found", http.StatusNotFound)
-		return
-	}
-
-	jsonOK(w, map[string]any{"blame_edges": edges})
+	jsonOK(w, map[string]any{"blame_edges": edges, "count": len(edges)})
 }
 
 // ConfirmBlame handles POST /blame/{id}/confirm
@@ -93,8 +114,11 @@ func (h *BlameHandler) updateStatus(w http.ResponseWriter, r *http.Request, stat
 		return
 	}
 
-	edge := models.BlameEdge{ID: id, Status: status}
-	if err := h.store.UpdateBlameEdge(r.Context(), edge); err != nil {
+	if err := h.store.UpdateBlameStatus(r.Context(), id, status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			jsonError(w, "not found", http.StatusNotFound)
+			return
+		}
 		jsonError(w, "updating blame edge", http.StatusInternalServerError)
 		return
 	}

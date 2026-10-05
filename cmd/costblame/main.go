@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -30,6 +32,7 @@ import (
 	webhooknotify "github.com/prem0x01/costblame/internal/notify/webhook"
 	sqlitestore "github.com/prem0x01/costblame/internal/store/sqlite"
 	"github.com/prem0x01/costblame/internal/tui"
+	"github.com/prem0x01/costblame/internal/web"
 )
 
 var cfgFile string
@@ -109,7 +112,7 @@ func serveCmd() *cobra.Command {
 			notifier := buildNotifier(cfg.Notify)
 
 			// Build narrative generator (falls back to templates if no LLM is configured).
-			gen, err := buildNarrativeGenerator(cfg.LLM)
+			gen, narrativeMode, err := buildNarrativeGenerator(cfg.LLM)
 			if err != nil {
 				return err
 			}
@@ -129,7 +132,7 @@ func serveCmd() *cobra.Command {
 			// Correlation engine.
 			engine := correlate.NewEngine(
 				store, gen, notifier,
-				cfg.Cost.PollInterval,
+				cfg.Correlation.Interval,
 				cfg.Correlation.MinScoreToStore,
 			)
 
@@ -146,8 +149,32 @@ func serveCmd() *cobra.Command {
 			// Start correlation engine.
 			go engine.Run(ctx)
 
-			// Start HTTP server.
-			srv := api.New(cfg.Server.Addr(), store, webhooks)
+			// The web UI's system status reflects exactly what was built above —
+			// nothing here is re-derived or guessed separately.
+			deploySourceNames := make([]string, 0, len(deploySources))
+			for name := range deploySources {
+				deploySourceNames = append(deploySourceNames, name)
+			}
+			status := web.SystemStatus{
+				CostProvider:    costSrc.Name(),
+				DeploySources:   deploySourceNames,
+				NarrativeEngine: narrativeMode,
+			}
+
+			// Start HTTP server (JSON API under /api, browser UI on the clean paths).
+			apiToken, generated, err := resolveAPIToken(cfg.Server.APIToken)
+			if err != nil {
+				return err
+			}
+			if generated {
+				// Shown once so a zero-config install is still locked down. It
+				// changes on every restart; set server.api_token to pin it.
+				slog.Warn("server.api_token not set — generated a temporary token for the web UI and /api. "+
+					"Log in with any username and this password, or send it as a bearer token. "+
+					"Set COSTBLAME_SERVER_API_TOKEN to keep it stable across restarts.",
+					"token", apiToken)
+			}
+			srv := api.New(cfg.Server.Addr(), apiToken, store, webhooks, web.New(store, status))
 			slog.Info("costblame started", "addr", cfg.Server.Addr())
 			return srv.Start(ctx)
 		},
@@ -249,19 +276,50 @@ func buildNotifier(cfg config.NotifyConfig) notify.Notifier {
 // GITHUB_*/GITLAB_* env vars). Filling in a source is what enables it.
 func buildDeploySources(cfg config.SourcesConfig) map[string]webhookSource {
 	sources := make(map[string]webhookSource)
-	if cfg.GitHub.WebhookSecret != "" || cfg.GitHub.Token != "" {
-		sources["github"] = githubcollect.NewWebhookHandler(cfg.GitHub.WebhookSecret, cfg.GitHub.Token)
+	switch {
+	case cfg.GitHub.WebhookSecret != "":
+		sources["github"] = githubcollect.NewWebhookHandler(cfg.GitHub.WebhookSecret, cfg.GitHub.Token, cfg.GitHub.DeployWorkflows)
+		if len(cfg.GitHub.DeployWorkflows) == 0 {
+			slog.Info("github: sources.github.deploy_workflows not set — every successful push-triggered " +
+				"workflow run on main/release/deploy branches counts as a deploy (one per commit); " +
+				"set it to your deploy workflow(s) for precise deploy times")
+		}
+	case cfg.GitHub.Token != "":
+		// An HMAC computed with an empty key is trivially forgeable, so a
+		// receiver without a secret would let anyone inject deploy events.
+		slog.Warn("github token configured but sources.github.webhook_secret is empty — " +
+			"refusing to mount the GitHub webhook receiver; set a webhook secret to enable it")
 	}
 	if cfg.GitLab.WebhookSecret != "" {
 		sources["gitlab"] = gitlabcollect.New(cfg.GitLab.WebhookSecret)
 	}
-	if cfg.ArgoCD.Enabled {
-		sources["argocd"] = argocdcollect.New()
+	switch {
+	case cfg.ArgoCD.Enabled && cfg.ArgoCD.Token != "":
+		sources["argocd"] = argocdcollect.New(cfg.ArgoCD.Token)
+	case cfg.ArgoCD.Enabled:
+		// Unauthenticated, the endpoint would let anyone inject fake deploys.
+		slog.Warn("sources.argocd.enabled is true but sources.argocd.token is empty — " +
+			"refusing to mount the ArgoCD webhook receiver; set a token and send it as " +
+			"an `Authorization: Bearer <token>` header from ArgoCD's webhook notification")
 	}
 	for name := range sources {
 		slog.Info("deploy source enabled", "source", name)
 	}
 	return sources
+}
+
+// resolveAPIToken returns the configured API token, or a freshly generated
+// random one (generated=true) when none is set, so the UI and API are never
+// left open by default.
+func resolveAPIToken(configured string) (token string, generated bool, err error) {
+	if configured != "" {
+		return configured, false, nil
+	}
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return "", false, fmt.Errorf("generating API token: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b), true, nil
 }
 
 // webhookSource is a deploy source that receives its events over HTTP.
@@ -274,8 +332,10 @@ type webhookSource interface {
 // With no provider set, it auto-detects from whichever conventional env var is
 // present (ANTHROPIC_API_KEY, OPENAI_API_KEY, OLLAMA_HOST). A missing key
 // degrades to template narratives instead of failing — costblame never
-// requires an LLM to run.
-func buildNarrativeGenerator(cfg config.LLMConfig) (correlate.NarrativeGenerator, error) {
+// requires an LLM to run. The returned string is the effective mode
+// ("template", "anthropic", "openai", "ollama"), surfaced in the web UI's
+// system status so an operator can see what's actually active.
+func buildNarrativeGenerator(cfg config.LLMConfig) (correlate.NarrativeGenerator, string, error) {
 	provider := cfg.Provider
 	if provider == "" || provider == "auto" {
 		provider = detectLLMProvider(cfg)
@@ -287,39 +347,39 @@ func buildNarrativeGenerator(cfg config.LLMConfig) (correlate.NarrativeGenerator
 	switch provider {
 	case "none":
 		slog.Info("no LLM configured — using template narratives")
-		return &narrative.NoopGenerator{}, nil
+		return &narrative.NoopGenerator{}, "template", nil
 
 	case "anthropic":
 		key := firstNonEmpty(cfg.APIKey, os.Getenv("ANTHROPIC_API_KEY"))
 		if key == "" {
 			slog.Warn("llm.provider is anthropic but no API key found — using template narratives")
-			return &narrative.NoopGenerator{}, nil
+			return &narrative.NoopGenerator{}, "template", nil
 		}
-		return narrative.New(key, cfg.Model), nil
+		return narrative.New(key, cfg.Model), "anthropic", nil
 
 	case "openai":
 		key := firstNonEmpty(cfg.APIKey, os.Getenv("OPENAI_API_KEY"))
 		base := firstNonEmpty(cfg.BaseURL, os.Getenv("OPENAI_BASE_URL"), "https://api.openai.com/v1")
 		if key == "" && base == "https://api.openai.com/v1" {
 			slog.Warn("llm.provider is openai but no API key found — using template narratives")
-			return &narrative.NoopGenerator{}, nil
+			return &narrative.NoopGenerator{}, "template", nil
 		}
 		model := cfg.Model
 		if model == "" {
 			if base != "https://api.openai.com/v1" {
-				return nil, fmt.Errorf("llm.model is required when using a custom base_url (%s)", base)
+				return nil, "", fmt.Errorf("llm.model is required when using a custom base_url (%s)", base)
 			}
 			model = "gpt-4o-mini"
 		}
-		return narrative.NewOpenAICompatible(base, key, model), nil
+		return narrative.NewOpenAICompatible(base, key, model), "openai", nil
 
 	case "ollama":
 		base := firstNonEmpty(cfg.BaseURL, ollamaBaseURL(os.Getenv("OLLAMA_HOST")), "http://localhost:11434/v1")
 		model := firstNonEmpty(cfg.Model, "llama3.1")
-		return narrative.NewOpenAICompatible(base, cfg.APIKey, model), nil
+		return narrative.NewOpenAICompatible(base, cfg.APIKey, model), "ollama", nil
 
 	default:
-		return nil, fmt.Errorf("unknown llm provider %q — built-in: anthropic, openai, ollama, none; add your own by implementing correlate.NarrativeGenerator", cfg.Provider)
+		return nil, "", fmt.Errorf("unknown llm provider %q — built-in: anthropic, openai, ollama, none; add your own by implementing correlate.NarrativeGenerator", cfg.Provider)
 	}
 }
 
@@ -389,7 +449,11 @@ func pollCosts(ctx context.Context, src collect.CostSource, store *sqlitestore.S
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	collect := func() {
-		to := time.Now().UTC()
+		// Collect the most recent complete UTC day. Day-aligned boundaries keep
+		// the snapshot's natural key stable across polls, so re-polls upsert the
+		// same row (refreshing amounts as Cost Explorer data settles) instead of
+		// inserting duplicates that would be re-blamed and re-alerted.
+		to := time.Now().UTC().Truncate(24 * time.Hour)
 		from := to.Add(-24 * time.Hour)
 		snaps, err := src.Collect(ctx, from, to)
 		if err != nil {

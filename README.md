@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/images/costblame-gotcha.png" alt="The Go gopher in a detective hat points a magnifying glass at the commit that caused a cloud cost spike: GOTCHA!" width="520">
+
 # 💸 costblame
 
 ### `git blame`, but for your cloud bill.
@@ -73,7 +75,7 @@ Six steps, fully automatic:
 
 1. **Polls your cloud billing API** on a configurable interval. For each service, it computes a rolling 30-day baseline and flags anything more than 2 standard deviations above it as an anomaly.
 2. **Ingests deploy events** from your CI/CD via webhooks, enriching each one asynchronously with PR metadata and changed file paths.
-3. **Scores every deployment** in the 72-hour window before each anomaly on four independent, explainable factors. The weighted sum is the confidence score — no black box.
+3. **Scores every deployment** from the 72 hours before the anomalous cost period through the end of that period on four independent, explainable factors. The weighted sum is the confidence score — no black box.
 4. **Generates a narrative** — a 2–3 sentence plain-English explanation of what spiked, what probably caused it, and what to do next. Uses your LLM if you configure one, clean templates if you don't. **An LLM is never required.**
 5. **Alerts your team** through every notifier you've configured — chat, incident tooling, or any HTTP endpoint.
 6. **Takes feedback** through a REST API and terminal UI: confirm a blame and future scoring gets sharper; dismiss it and the false positive is remembered.
@@ -150,7 +152,7 @@ The whole system is one process. Data flows top to bottom: the outside world fee
 ║  │ (4) CORRELATION ENGINE — answers "who did this?"          │      │        ║
 ║  │                                                           │      │        ║
 ║  │ for each anomaly nobody has blamed yet:                   │      │        ║
-║  │   · collect every deploy from the 72 h before the spike   │      │        ║
+║  │   · collect every deploy from 72 h before → end of period │      │        ║
 ║  │   · score each (anomaly, deploy) pair on 4 factors:       │      │        ║
 ║  │       time 40% · service 30% · tags 20% · history 10%     │      │        ║
 ║  │   · <0.10 drop  ·  ≥0.10 keep as pending  ·  ≥0.65 act    │      │        ║
@@ -186,7 +188,9 @@ Every configured `collect.DeploySource` gets its own endpoint at `POST /webhooks
 - **Phase 1 (synchronous, ~1ms):** verify the signature (HMAC-SHA256 for GitHub, token header for GitLab — both in constant time), then immediately return `202 Accepted`.
 - **Phase 2 (background goroutine):** parse the payload, call back to the source API for PR title, author, labels, and changed file paths, infer which cloud services the change touches, and upsert the `DeployEvent`. The upsert merges enrichment into the existing row, so a slow PR-metadata fetch never loses the original event.
 
-Events flow through a buffered channel; if a source floods faster than the store can absorb, costblame sheds load by dropping (and logging) rather than blocking your pipeline's webhook delivery.
+**One commit is one deploy.** A deploy's ID is derived from its repository and commit (for ArgoCD: app and revision), never from the delivery. Webhook redeliveries, several workflows finishing for the same commit, and the raw-then-enriched two-phase flow all land on one row, so a single merge can't show up as four competing blame candidates. Merging only fills blanks and never overwrites, and the deploy time keeps the *earliest* event — the moment the code first landed — so a later run on an old commit (a nightly scheduled scan, say) can't make a days-old change look freshly deployed. Re-deploying the exact same commit therefore isn't a new candidate; the code didn't change.
+
+Events flow through a buffered channel. If the queue is full, the GitHub receiver answers `503` with `Retry-After` and queues nothing. The delivery then shows as failed under the webhook's *Recent Deliveries*, where it can be redelivered (UI or API); because IDs are deterministic, redelivery can't create a duplicate. The GitLab and ArgoCD receivers acknowledge first and drop (and log) when full.
 
 ### ❸ The embedded store
 
@@ -219,7 +223,7 @@ Every `(anomaly, deployment)` pair is scored by four independent factors. The we
 
 | Factor | Weight | How it's calculated |
 |--------|--------|---------------------|
-| `temporal_proximity` | **40%** | Decay curve: 1.0 if the deploy was within 2h of the spike, 0.85 within 6h, 0.60 within 24h, 0.30 within 48h, 0.10 within 72h, 0.0 beyond |
+| `temporal_proximity` | **40%** | A deploy *during* the cost period scores 1.0 (0.5 if it landed in the last quarter of the period and had little time to accrue cost). For earlier deploys, a decay curve measured back from the period start: 1.0 within 2h, 0.85 within 6h, 0.60 within 24h, 0.30 within 48h, 0.10 within 72h, 0.0 beyond. Deploys after the period ended score 0 |
 | `service_match` | **30%** | 1.0 if the deploy's inferred cloud services (from changed file paths) exactly match the anomalous service; 0.7 for a partial match; 0.0 for no match |
 | `tag_match` | **20%** | Compares cost allocation tags (`team`, `env`) on the anomaly against the deployment's repository and environment metadata |
 | `historical_pattern` | **10%** | Boosts the score if the same author has caused *confirmed* cost spikes on the same service before (capped at 4 prior incidents) |
@@ -386,6 +390,9 @@ cost:
     region: us-east-1
     granularity: DAILY          # DAILY or HOURLY
 
+server:
+  api_token: ""                 # protects the web UI and /api; blank = generated at startup (see logs)
+
 database:
   driver: sqlite
   dsn: /data/costblame.db
@@ -394,10 +401,12 @@ sources:                        # CI/CD adapters — filled in = enabled
   github:
     webhook_secret: "your-secret"
     token: ""                   # optional — enables PR enrichment
+    deploy_workflows: []        # e.g. ["Deploy", "release.yml"]; empty = any push-triggered run on main
   gitlab:
     webhook_secret: ""          # set to enable /webhooks/gitlab
   argocd:
-    enabled: false              # explicit opt-in (ArgoCD webhooks have no secret)
+    enabled: false              # explicit opt-in
+    token: ""                   # required — ArgoCD sends it as "Authorization: Bearer <token>"
 
 llm:                            # optional — template narratives without it
   provider: ""                  # anthropic | openai | ollama | none | "" (auto-detect)
@@ -415,6 +424,7 @@ notify:                         # every configured destination gets the alert
     min_confidence: 0.65
 
 correlation:
+  interval: 1m                  # how often new anomalies are scored (cheap, local)
   lookback_window: 72h
   high_confidence_threshold: 0.65
   min_score_to_store: 0.10
@@ -432,8 +442,11 @@ Any YAML key maps to `COSTBLAME_<SECTION>_<KEY>` (dots become underscores): `COS
 | `ANTHROPIC_API_KEY` | Narratives via the Anthropic API |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL` | Narratives via OpenAI or any compatible host |
 | `OLLAMA_HOST` | Narratives via a local Ollama server |
-| `GITHUB_WEBHOOK_SECRET`, `GITHUB_TOKEN` | Enables the GitHub source (+ PR enrichment) |
+| `GITHUB_WEBHOOK_SECRET`, `GITHUB_TOKEN` | Enables the GitHub source (secret required; token adds PR enrichment) |
+| `COSTBLAME_SOURCES_GITHUB_DEPLOY_WORKFLOWS` | Comma-separated workflows that count as deploys, e.g. `Deploy,release.yml` |
 | `GITLAB_WEBHOOK_SECRET` | Enables the GitLab source |
+| `ARGOCD_WEBHOOK_TOKEN` | Bearer token ArgoCD must send (required to enable the ArgoCD source) |
+| `COSTBLAME_SERVER_API_TOKEN` | Token for the web UI and `/api` (generated at startup if unset) |
 | `SLACK_BOT_TOKEN`, `SLACK_CHANNEL` | Enables Slack alerts |
 
 Explicit config (YAML or `COSTBLAME_*`) always wins over conventional fallbacks.
@@ -444,14 +457,25 @@ Explicit config (YAML or `COSTBLAME_*`) always wins over conventional fallbacks.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/blame` | List recent blame edges (resolved + confirmed) |
-| `GET` | `/blame/:id` | Get a single blame edge with full context |
-| `POST` | `/blame/:id/confirm` | Mark edge as confirmed (boosts historical scoring) |
-| `POST` | `/blame/:id/dismiss` | Mark edge as dismissed (false positive) |
-| `GET` | `/anomalies` | List unblamed cost anomalies |
-| `GET` | `/healthz` | Health check — returns `ok` |
+| `GET` | `/api/blame` | List recent blame edges (resolved + confirmed) |
+| `GET` | `/api/blame/:id` | Get a single blame edge by its edge ID |
+| `POST` | `/api/blame/:id/confirm` | Mark edge as confirmed (boosts historical scoring) |
+| `POST` | `/api/blame/:id/dismiss` | Mark edge as dismissed (false positive) |
+| `GET` | `/api/anomalies` | List unblamed cost anomalies |
+| `GET` | `/api/anomalies/:id/blame` | List every candidate blame edge for one anomaly, best first |
+| `GET` | `/healthz` | Health check — returns `ok` (no auth) |
 
-Webhook receivers are mounted on the same port at `POST /webhooks/<source>` for every enabled source.
+### Authentication
+
+The web UI and everything under `/api` require the **API token** (`server.api_token` / `COSTBLAME_SERVER_API_TOKEN`). Send it as a bearer token, or as the password in HTTP Basic auth with any username — browsers show a login prompt, `curl -u :$TOKEN` works too:
+
+```bash
+curl -H "Authorization: Bearer $COSTBLAME_SERVER_API_TOKEN" http://localhost:8080/api/blame
+```
+
+If no token is configured, `costblame serve` generates a random one at startup and prints it in the log, so a fresh install is never left open. It changes on every restart — set it explicitly for scripts and dashboards. State-changing requests that a browser marks as cross-site are rejected (CSRF protection); scripts and `curl` are unaffected. If you serve costblame behind a reverse proxy, forward the original `Host` header so same-origin checks match.
+
+Webhook receivers (`POST /webhooks/<source>`), `/healthz` and `/static/*` need no token — the receivers verify their own signatures or tokens (below). They are mounted on the same port for every enabled source.
 
 ---
 
@@ -484,9 +508,13 @@ Credentials come from the standard SDK chain (env vars, shared config, IAM role 
 2. Payload URL: `https://your-host:7890/webhooks/github`
 3. Content type: `application/json`
 4. Secret: the value of `sources.github.webhook_secret` (or `GITHUB_WEBHOOK_SECRET`)
-5. Events: select **Workflow runs**
+5. Events: select **Workflow runs**, and optionally **Deployment statuses**
 
-Set `sources.github.token` (or `GITHUB_TOKEN`) to enable PR metadata and changed-file enrichment.
+Set `sources.github.token` (or `GITHUB_TOKEN`) to enable PR metadata and changed-file enrichment. Without a token, deploys are still recorded but carry no PR, author or changed files, so they can't match a service or an author — scores for them stay low.
+
+**Tell costblame which workflow is your deploy.** By default every successful, push-triggered run on `main`/`master`/`release/*`/`deploy/*` counts as a deploy — one per commit, so CI, lint and deploy runs for the same merge don't multiply, but the recorded time is whichever finishes first. For precise deploy times set `sources.github.deploy_workflows` (or `COSTBLAME_SOURCES_GITHUB_DEPLOY_WORKFLOWS="Deploy,Release"`). Entries match a workflow's name or file path, case-insensitively, with `*` globs, so `deploy.yml` keeps working if the workflow is renamed.
+
+Whatever the filter, these are never deploys: `schedule` and `pull_request*` triggered runs, failed or cancelled runs, and runs on other branches. `deployment_status` events count only when the deployment succeeded and its environment looks like production (`production`, `prod-eu`, `live`; not `preprod`, `non-prod` or `staging`) — a staging deploy of the same commit must not set the deploy time. A deploy workflow chained off CI with `on: workflow_run` is supported.
 
 ### Deploy events: GitLab CI
 
@@ -499,7 +527,7 @@ Successful pipelines on `main`/`master`/`release/*`/`deploy/*` branches are trea
 
 ### Deploy events: ArgoCD
 
-Set `sources.argocd.enabled: true` and point an ArgoCD notification webhook at `https://your-host:7890/webhooks/argocd`. ArgoCD webhooks carry no shared secret, so protect the endpoint at the network level.
+Set `sources.argocd.enabled: true` and `sources.argocd.token` (or `ARGOCD_WEBHOOK_TOKEN`), then point an ArgoCD notification webhook at `https://your-host:7890/webhooks/argocd` with the header `Authorization: Bearer <token>`. Without a token the receiver is not mounted — an open endpoint would let anyone inject fake deploys and frame an author.
 
 ### Narratives: any LLM, or none
 

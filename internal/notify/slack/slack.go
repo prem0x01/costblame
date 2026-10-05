@@ -12,9 +12,9 @@ import (
 
 // Notifier posts blame graph alerts to a Slack channel using the Slack Web API.
 type Notifier struct {
-	client    *slackapi.Client
-	channel   string
-	minScore  float64
+	client   *slackapi.Client
+	channel  string
+	minScore float64
 }
 
 // New creates a Slack Notifier.

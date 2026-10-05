@@ -16,6 +16,11 @@
 server:
   host: 0.0.0.0
   port: 8080
+  # Protects the web UI and /api (webhooks verify their own signatures).
+  # Use it as a bearer token, or as the password in HTTP Basic auth (any
+  # username). Leave empty and `serve` generates a temporary one on every start
+  # and logs it — set this to keep it stable. Also: COSTBLAME_SERVER_API_TOKEN.
+  api_token: ""
 
 # ──────────────────────────────────────────────
 # Storage
@@ -50,6 +55,11 @@ sources:
   github:
     webhook_secret: "changeme"
     token: ""             # optional — enables PR metadata + changed-file enrichment
+    # Which workflows count as deploys: matched case-insensitively (with * globs)
+    # against each run's name and file path. Empty = every successful
+    # push-triggered run on main/master/release/*/deploy/* (one per commit).
+    # Env: COSTBLAME_SOURCES_GITHUB_DEPLOY_WORKFLOWS="Deploy,Release"
+    deploy_workflows: []
     # poll_interval: 5m   # non-zero switches to API polling instead of webhooks
 
   # GitLab CI pipeline events. Mounted at POST /webhooks/gitlab.
@@ -57,10 +67,12 @@ sources:
     webhook_secret: ""    # validates the X-Gitlab-Token header
 
   # ArgoCD application sync events. Mounted at POST /webhooks/argocd.
-  # ArgoCD webhooks carry no secret — explicit opt-in; protect the endpoint
-  # at the network level.
+  # Opt-in, and a token is required: configure ArgoCD's webhook notification
+  # to send `Authorization: Bearer <token>`. Without a token the receiver is
+  # not mounted, because anyone could otherwise inject fake deploys.
   argocd:
     enabled: false
+    token: ""             # or ARGOCD_WEBHOOK_TOKEN
 
 # ──────────────────────────────────────────────
 # AI narratives (optional — costblame runs fine without an LLM)
@@ -94,6 +106,7 @@ notify:
 # Correlation engine
 # ──────────────────────────────────────────────
 correlation:
+  interval: 1m                    # how often the engine scores new anomalies (cheap, local)
   lookback_window: 72h            # how far back to search for causative deploys
   high_confidence_threshold: 0.65 # narrative + alert above this score
   min_score_to_store: 0.10        # discard edges below this score

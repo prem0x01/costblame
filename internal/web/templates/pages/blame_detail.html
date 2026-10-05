@@ -1,0 +1,52 @@
+{{define "content"}}
+{{$e := .Edge}}
+<h1>{{if $e.CostSnapshot}}{{$e.CostSnapshot.Service}}{{else}}Blame edge{{end}} cost spike</h1>
+
+<div class="detail-section">
+  {{template "status_badge.html" $e}}
+</div>
+
+{{if $e.Narrative}}
+<div class="detail-section">
+  <p>{{$e.Narrative}}</p>
+</div>
+{{end}}
+
+{{if $e.CostSnapshot}}
+<div class="detail-section">
+  <h2>Cost anomaly</h2>
+  <p>
+    {{money $e.CostSnapshot.AmountUSD}} (was {{money $e.CostSnapshot.PrevAmountUSD}}, {{signedPct $e.CostSnapshot.DeltaPct}})<br>
+    <span class="muted">Period starting {{$e.CostSnapshot.PeriodStart.Format "Jan 2 15:04 UTC"}}</span>
+  </p>
+  <div class="chart-wrap">
+    <h2 class="chart-title">{{$e.CostSnapshot.Service}} &middot; last {{len .History}} periods</h2>
+    {{sparkline .History}}
+  </div>
+</div>
+{{end}}
+
+{{if $e.DeployEvent}}
+<div class="detail-section">
+  <h2>Most likely deployment</h2>
+  <p>
+    PR #{{$e.DeployEvent.PRNumber}} &mdash; &ldquo;{{$e.DeployEvent.PRTitle}}&rdquo; by @{{$e.DeployEvent.PRAuthor}}<br>
+    <span class="muted">Deployed {{$e.DeployEvent.OccurredAt.Format "Jan 2 15:04 UTC"}} to {{$e.DeployEvent.Repository}} ({{$e.DeployEvent.Branch}})</span>
+  </p>
+</div>
+{{end}}
+
+<div class="detail-section">
+  <h2>Confidence factors</h2>
+  {{range $e.ConfidenceFactors}}
+  <div class="factor-row">
+    <div class="factor-head">
+      <span class="factor-name">{{.Name}}</span>
+      <span class="factor-score">{{pct .Score}}</span>
+    </div>
+    <div class="factor-bar"><div class="factor-bar-fill" style="width: {{pct .Score}}"></div></div>
+    <span class="factor-reason">{{.Reason}}</span>
+  </div>
+  {{end}}
+</div>
+{{end}}

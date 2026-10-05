@@ -1,0 +1,33 @@
+{{define "content"}}
+<div class="page-head">
+  <h1>Unblamed anomalies</h1>
+  <p class="page-subtitle">Cost snapshots flagged as statistically abnormal that don't have a blame edge yet — either just detected, or no deploy candidate was found in the lookback window.</p>
+</div>
+
+{{if not .Anomalies}}
+  <div class="empty-state">
+    <p>No unblamed anomalies.</p>
+    {{if not .Status.HasCostSource}}
+      <p class="muted">costblame has no cost source connected yet, so nothing is being scanned for spikes. <a class="plain" href="/">Connect one from the dashboard &rarr;</a></p>
+    {{else}}
+      <p class="muted">Either nothing unusual has happened, or every anomaly so far has already been matched to a deploy — check the <a class="plain" href="/blame">blame edges</a> page.</p>
+    {{end}}
+  </div>
+{{else}}
+<table>
+  <thead>
+    <tr><th>Service</th><th>Amount</th><th>Delta</th><th>Period</th></tr>
+  </thead>
+  <tbody>
+    {{range .Anomalies}}
+    <tr class="row-enter">
+      <td>{{.Service}}</td>
+      <td>{{money .AmountUSD}} <span class="muted">(was {{money .PrevAmountUSD}})</span></td>
+      <td>{{signedPct .DeltaPct}}</td>
+      <td>{{.PeriodStart.Format "Jan 2 15:04 UTC"}}</td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{end}}
+{{end}}

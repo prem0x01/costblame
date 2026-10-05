@@ -11,8 +11,8 @@ import (
 	"fmt"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/google/uuid"
+	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/prem0x01/costblame/pkg/models"
 )
@@ -97,11 +97,20 @@ func (s *Store) SaveCostSnapshots(ctx context.Context, snaps []models.CostSnapsh
 	defer tx.Rollback()
 
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT OR IGNORE INTO cost_snapshots
+		INSERT INTO cost_snapshots
 			(id, collected_at, period_start, period_end, source, service, region,
 			 tags, amount_usd, prev_amount_usd, delta_usd, delta_pct,
 			 is_anomaly, anomaly_score, granularity)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(id) DO UPDATE SET
+			collected_at    = excluded.collected_at,
+			tags            = excluded.tags,
+			amount_usd      = excluded.amount_usd,
+			prev_amount_usd = excluded.prev_amount_usd,
+			delta_usd       = excluded.delta_usd,
+			delta_pct       = excluded.delta_pct,
+			is_anomaly      = excluded.is_anomaly,
+			anomaly_score   = excluded.anomaly_score`)
 	if err != nil {
 		return err
 	}
@@ -142,6 +151,29 @@ func (s *Store) UnblamedAnomalies(ctx context.Context) ([]models.CostSnapshot, e
 	return scanSnapshots(rows)
 }
 
+func (s *Store) UnscoredAnomalies(ctx context.Context) ([]models.CostSnapshot, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, collected_at, period_start, period_end,
+		       source, service, region, tags,
+		       amount_usd, prev_amount_usd, delta_usd, delta_pct,
+		       is_anomaly, anomaly_score, granularity
+		FROM cost_snapshots
+		WHERE is_anomaly = 1 AND scored_at IS NULL
+		ORDER BY period_start DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanSnapshots(rows)
+}
+
+func (s *Store) MarkAnomalyScored(ctx context.Context, id uuid.UUID) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE cost_snapshots SET scored_at = ? WHERE id = ?`,
+		time.Now().UTC(), id.String())
+	return err
+}
+
 func (s *Store) CostSnapshotsByService(ctx context.Context, service string, from, to time.Time) ([]models.CostSnapshot, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, collected_at, period_start, period_end,
@@ -160,10 +192,17 @@ func (s *Store) CostSnapshotsByService(ctx context.Context, service string, from
 
 // --- DeployEvent ---
 
+// UpsertDeployEvent inserts a deploy event, or merges it into the existing row
+// with the same ID. Merging only ever fills blanks: a value already stored is
+// never overwritten, so enrichment is additive and the order events arrive in
+// (raw before enriched, or two workflows for one commit) does not matter. The
+// one exception is occurred_at, which keeps the EARLIEST time — the first
+// moment the code landed. Moving it forward would let a nightly scheduled run
+// on an old commit make a days-old change look like a fresh deploy.
 func (s *Store) UpsertDeployEvent(ctx context.Context, e models.DeployEvent) error {
-	labels, _ := json.Marshal(e.PRLabels)
-	files, _ := json.Marshal(e.ChangedFiles)
-	services, _ := json.Marshal(e.InferredServices)
+	labels := jsonStrings(e.PRLabels)
+	files := jsonStrings(e.ChangedFiles)
+	services := jsonStrings(e.InferredServices)
 	raw := e.RawPayload
 	if raw == nil {
 		raw = []byte("{}")
@@ -176,14 +215,22 @@ func (s *Store) UpsertDeployEvent(ctx context.Context, e models.DeployEvent) err
 			 changed_files, inferred_services, environment, status, raw_payload)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
-			pr_number         = excluded.pr_number,
-			pr_title          = excluded.pr_title,
-			pr_author         = excluded.pr_author,
-			pr_team           = excluded.pr_team,
-			pr_labels         = excluded.pr_labels,
-			changed_files     = excluded.changed_files,
-			inferred_services = excluded.inferred_services`,
-		e.ID.String(), e.OccurredAt, string(e.Source), e.Repository, e.Branch, e.CommitSHA,
+			occurred_at       = MIN(deploy_events.occurred_at, excluded.occurred_at),
+			repository        = COALESCE(NULLIF(deploy_events.repository, ''), excluded.repository),
+			branch            = COALESCE(NULLIF(deploy_events.branch, ''), excluded.branch),
+			commit_sha        = COALESCE(NULLIF(deploy_events.commit_sha, ''), excluded.commit_sha),
+			pr_number         = CASE WHEN deploy_events.pr_number = 0 THEN excluded.pr_number ELSE deploy_events.pr_number END,
+			pr_title          = COALESCE(NULLIF(deploy_events.pr_title, ''), excluded.pr_title),
+			pr_author         = COALESCE(NULLIF(deploy_events.pr_author, ''), excluded.pr_author),
+			pr_team           = COALESCE(NULLIF(deploy_events.pr_team, ''), excluded.pr_team),
+			pr_labels         = CASE WHEN deploy_events.pr_labels IN ('', '[]', 'null') THEN excluded.pr_labels ELSE deploy_events.pr_labels END,
+			changed_files     = CASE WHEN deploy_events.changed_files IN ('', '[]', 'null') THEN excluded.changed_files ELSE deploy_events.changed_files END,
+			inferred_services = CASE WHEN deploy_events.inferred_services IN ('', '[]', 'null') THEN excluded.inferred_services ELSE deploy_events.inferred_services END,
+			environment       = CASE WHEN deploy_events.environment IN ('', 'unknown') THEN excluded.environment ELSE deploy_events.environment END,
+			raw_payload       = CASE WHEN deploy_events.raw_payload IN ('', '{}') THEN excluded.raw_payload ELSE deploy_events.raw_payload END`,
+		// UTC so the text comparison behind MIN() and DeploysBetween() is
+		// consistent no matter which offset a source reported.
+		e.ID.String(), e.OccurredAt.UTC(), string(e.Source), e.Repository, e.Branch, e.CommitSHA,
 		e.PRNumber, e.PRTitle, e.PRAuthor, e.PRTeam, string(labels),
 		string(files), string(services), e.Environment, string(e.Status), string(raw),
 	)
@@ -248,33 +295,61 @@ func (s *Store) UpdateBlameEdge(ctx context.Context, edge models.BlameEdge) erro
 	return err
 }
 
-func (s *Store) BlameEdgesBySnapshot(ctx context.Context, snapshotID uuid.UUID) ([]models.BlameEdge, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, cost_snapshot_id, deploy_event_id, confidence_score,
-		       confidence_factors, narrative, status, created_at
-		FROM blame_edges
-		WHERE cost_snapshot_id = ?
-		ORDER BY confidence_score DESC`, snapshotID.String())
+func (s *Store) BlameEdgeByID(ctx context.Context, id uuid.UUID) (*models.BlameEdge, error) {
+	rows, err := s.db.QueryContext(ctx, blameEdgeSelectJoined+`
+		WHERE be.id = ?`, id.String())
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanBlameEdges(rows)
+	edges, err := scanBlameEdgesWithJoins(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(edges) == 0 {
+		return nil, sql.ErrNoRows
+	}
+	return &edges[0], nil
+}
+
+func (s *Store) UpdateBlameStatus(ctx context.Context, id uuid.UUID, status models.BlameStatus) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE blame_edges SET status = ? WHERE id = ?`,
+		string(status), id.String())
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) BlameEdgesBySnapshot(ctx context.Context, snapshotID uuid.UUID) ([]models.BlameEdge, error) {
+	rows, err := s.db.QueryContext(ctx, blameEdgeSelectJoined+`
+		WHERE be.cost_snapshot_id = ?
+		ORDER BY be.confidence_score DESC`, snapshotID.String())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanBlameEdgesWithJoins(rows)
 }
 
 func (s *Store) RecentBlameEdges(ctx context.Context, limit int) ([]models.BlameEdge, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, cost_snapshot_id, deploy_event_id, confidence_score,
-		       confidence_factors, narrative, status, created_at
-		FROM blame_edges
-		WHERE status IN ('resolved','confirmed')
-		ORDER BY created_at DESC
+	rows, err := s.db.QueryContext(ctx, blameEdgeSelectJoined+`
+		WHERE be.status IN ('resolved','confirmed')
+		ORDER BY be.created_at DESC
 		LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanBlameEdges(rows)
+	return scanBlameEdgesWithJoins(rows)
 }
 
 func (s *Store) ConfirmedBlameCount(ctx context.Context, author, service string) (int, error) {
@@ -336,23 +411,85 @@ func scanDeployEvents(rows *sql.Rows) ([]models.DeployEvent, error) {
 	return events, rows.Err()
 }
 
-func scanBlameEdges(rows *sql.Rows) ([]models.BlameEdge, error) {
+// blameEdgeSelectJoined selects a blame edge alongside its cost snapshot and
+// deploy event rows, so callers get the denormalized BlameEdge.CostSnapshot /
+// BlameEdge.DeployEvent fields populated on read (see models.BlameEdge).
+// Callers append a WHERE/ORDER/LIMIT clause.
+const blameEdgeSelectJoined = `
+	SELECT be.id, be.cost_snapshot_id, be.deploy_event_id, be.confidence_score,
+	       be.confidence_factors, be.narrative, be.status, be.created_at,
+	       cs.collected_at, cs.period_start, cs.period_end, cs.source, cs.service,
+	       cs.region, cs.tags, cs.amount_usd, cs.prev_amount_usd, cs.delta_usd,
+	       cs.delta_pct, cs.is_anomaly, cs.anomaly_score, cs.granularity,
+	       de.occurred_at, de.source, de.repository, de.branch, de.commit_sha,
+	       de.pr_number, de.pr_title, de.pr_author, de.pr_team, de.pr_labels,
+	       de.changed_files, de.inferred_services, de.environment, de.status, de.raw_payload
+	FROM blame_edges be
+	JOIN cost_snapshots cs ON cs.id = be.cost_snapshot_id
+	JOIN deploy_events de ON de.id = be.deploy_event_id`
+
+func scanBlameEdgesWithJoins(rows *sql.Rows) ([]models.BlameEdge, error) {
 	var edges []models.BlameEdge
 	for rows.Next() {
 		var e models.BlameEdge
 		var id, snapshotID, deployID, factorsJSON, status string
-		if err := rows.Scan(&id, &snapshotID, &deployID, &e.ConfidenceScore,
-			&factorsJSON, &e.Narrative, &status, &e.CreatedAt); err != nil {
+
+		var snap models.CostSnapshot
+		var snapGran, snapTagsJSON string
+		var snapIsAnomaly int
+
+		var deploy models.DeployEvent
+		var deploySource, deployLabelsJSON, deployFilesJSON, deployServicesJSON, deployStatus string
+		var deployRaw []byte
+
+		if err := rows.Scan(
+			&id, &snapshotID, &deployID, &e.ConfidenceScore,
+			&factorsJSON, &e.Narrative, &status, &e.CreatedAt,
+			&snap.CollectedAt, &snap.PeriodStart, &snap.PeriodEnd, &snap.Source, &snap.Service,
+			&snap.Region, &snapTagsJSON, &snap.AmountUSD, &snap.PrevAmountUSD, &snap.DeltaUSD,
+			&snap.DeltaPct, &snapIsAnomaly, &snap.AnomalyScore, &snapGran,
+			&deploy.OccurredAt, &deploySource, &deploy.Repository, &deploy.Branch, &deploy.CommitSHA,
+			&deploy.PRNumber, &deploy.PRTitle, &deploy.PRAuthor, &deploy.PRTeam, &deployLabelsJSON,
+			&deployFilesJSON, &deployServicesJSON, &deploy.Environment, &deployStatus, &deployRaw,
+		); err != nil {
 			return nil, err
 		}
+
 		e.ID, _ = uuid.Parse(id)
 		e.CostSnapshotID, _ = uuid.Parse(snapshotID)
 		e.DeployEventID, _ = uuid.Parse(deployID)
 		e.Status = models.BlameStatus(status)
 		_ = json.Unmarshal([]byte(factorsJSON), &e.ConfidenceFactors)
+
+		snap.ID = e.CostSnapshotID
+		snap.IsAnomaly = snapIsAnomaly == 1
+		snap.Granularity = models.Granularity(snapGran)
+		_ = json.Unmarshal([]byte(snapTagsJSON), &snap.Tags)
+		e.CostSnapshot = &snap
+
+		deploy.ID = e.DeployEventID
+		deploy.Source = models.DeploySource(deploySource)
+		deploy.Status = models.DeployStatus(deployStatus)
+		deploy.RawPayload = deployRaw
+		_ = json.Unmarshal([]byte(deployLabelsJSON), &deploy.PRLabels)
+		_ = json.Unmarshal([]byte(deployFilesJSON), &deploy.ChangedFiles)
+		_ = json.Unmarshal([]byte(deployServicesJSON), &deploy.InferredServices)
+		e.DeployEvent = &deploy
+
 		edges = append(edges, e)
 	}
 	return edges, rows.Err()
+}
+
+// jsonStrings encodes a string slice as a JSON array, writing "[]" for nil
+// (json.Marshal would produce "null", which the merge logic would then have to
+// special-case).
+func jsonStrings(v []string) string {
+	if v == nil {
+		return "[]"
+	}
+	b, _ := json.Marshal(v)
+	return string(b)
 }
 
 func boolToInt(b bool) int {

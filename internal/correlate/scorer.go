@@ -1,9 +1,11 @@
 package correlate
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/prem0x01/costblame/pkg/models"
 )
@@ -27,7 +29,7 @@ type Scorer struct {
 
 // HistoryReader provides historical blame data used by the historicalScore factor.
 type HistoryReader interface {
-	ConfirmedBlameCount(author, service string) int
+	ConfirmedBlameCount(ctx context.Context, author, service string) int
 }
 
 // NewScorer creates a Scorer backed by the given history reader.
@@ -36,12 +38,12 @@ func NewScorer(h HistoryReader) *Scorer {
 }
 
 // Score returns the individual ConfidenceFactors for a (anomaly, deploy) pair.
-func (s *Scorer) Score(anomaly models.CostSnapshot, deploy models.DeployEvent) []models.ConfidenceFactor {
+func (s *Scorer) Score(ctx context.Context, anomaly models.CostSnapshot, deploy models.DeployEvent) []models.ConfidenceFactor {
 	return []models.ConfidenceFactor{
 		s.temporalScore(anomaly, deploy),
 		s.serviceScore(anomaly, deploy),
 		s.tagScore(anomaly, deploy),
-		s.historicalScore(anomaly, deploy),
+		s.historicalScore(ctx, anomaly, deploy),
 	}
 }
 
@@ -54,20 +56,52 @@ func (s *Scorer) TotalScore(factors []models.ConfidenceFactor) float64 {
 	return math.Min(total, 1.0)
 }
 
-// temporalScore rewards deploys that happened just before the cost spike.
-// The window is 72 hours; anything older scores 0 to avoid false positives
-// from unrelated old deployments.
+// lateInPeriodFraction is the share of the cost period that must still remain
+// after a deploy for it to get full credit. A deploy in the last quarter of a
+// period had little time to accrue cost, so it is scored down, not excluded.
+const lateInPeriodFraction = 0.25
+
+// temporalScore rewards deploys that happened just before or during the cost
+// period. Billing periods are buckets (a whole UTC day for DAILY data), so a
+// deploy at 10:00 can be the cause of that day's spike: deploys inside
+// [PeriodStart, PeriodEnd] are scored by how much of the period they had to
+// act, and earlier deploys decay over 72 hours. Anything older scores 0 to
+// avoid false positives from unrelated old deployments.
 func (s *Scorer) temporalScore(anomaly models.CostSnapshot, deploy models.DeployEvent) models.ConfidenceFactor {
+	// A snapshot without a usable PeriodEnd is treated as a point in time.
+	periodEnd := anomaly.PeriodEnd
+	if periodEnd.Before(anomaly.PeriodStart) {
+		periodEnd = anomaly.PeriodStart
+	}
+
+	if deploy.OccurredAt.After(periodEnd) {
+		// Deploy happened after the cost period ended — cannot be the cause.
+		return models.ConfidenceFactor{
+			Name: "temporal_proximity", Score: 0, Weight: weightTemporal,
+			Reason: "deploy occurred after cost period",
+		}
+	}
+
+	if deploy.OccurredAt.After(anomaly.PeriodStart) {
+		period := periodEnd.Sub(anomaly.PeriodStart)
+		remaining := periodEnd.Sub(deploy.OccurredAt)
+		score := 1.0
+		reason := fmt.Sprintf("deploy %.1fh into the cost period, %.1fh before it ended", deploy.OccurredAt.Sub(anomaly.PeriodStart).Hours(), remaining.Hours())
+		if remaining < time.Duration(float64(period)*lateInPeriodFraction) {
+			score = 0.5
+			reason += " (late in period — limited exposure)"
+		}
+		return models.ConfidenceFactor{
+			Name: "temporal_proximity", Score: score, Weight: weightTemporal, Reason: reason,
+		}
+	}
+
 	hoursApart := anomaly.PeriodStart.Sub(deploy.OccurredAt).Hours()
 
 	var score float64
 	var reason string
 
 	switch {
-	case hoursApart < 0:
-		// Deploy happened after the cost period ended — cannot be the cause.
-		score = 0
-		reason = "deploy occurred after cost period"
 	case hoursApart <= 2:
 		score = 1.0
 		reason = fmt.Sprintf("deploy %.1fh before spike (≤2h window)", hoursApart)
@@ -161,8 +195,8 @@ func (s *Scorer) tagScore(anomaly models.CostSnapshot, deploy models.DeployEvent
 
 // historicalScore boosts the score when the same author has caused confirmed cost
 // spikes on the same service before — up to a cap of 4 prior incidents.
-func (s *Scorer) historicalScore(anomaly models.CostSnapshot, deploy models.DeployEvent) models.ConfidenceFactor {
-	count := s.history.ConfirmedBlameCount(deploy.PRAuthor, anomaly.Service)
+func (s *Scorer) historicalScore(ctx context.Context, anomaly models.CostSnapshot, deploy models.DeployEvent) models.ConfidenceFactor {
+	count := s.history.ConfirmedBlameCount(ctx, deploy.PRAuthor, anomaly.Service)
 	score := math.Min(float64(count)*0.25, 1.0)
 	return models.ConfidenceFactor{
 		Name:   "historical_pattern",

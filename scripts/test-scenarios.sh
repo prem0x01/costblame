@@ -11,6 +11,8 @@
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:7890}"
+# Token for the JSON API (server.api_token / COSTBLAME_SERVER_API_TOKEN).
+API_TOKEN="${API_TOKEN:-}"   # only the /api scenarios need it
 WEBHOOK_SECRET="${WEBHOOK_SECRET:-changeme}"
 DB_PATH="${DB_PATH:-}"   # leave blank to skip direct DB seeding
 
@@ -164,18 +166,18 @@ SQL
 
   pass "Inserted cost anomaly for AWSLambda (+145%, \$225 delta) with id=$SNAP_ID"
 
-  RESP=$(curl -sf "$BASE_URL/anomalies")
+  RESP=$(curl -sf -H "Authorization: Bearer $API_TOKEN" "$BASE_URL/api/anomalies")
   COUNT=$(echo "$RESP" | jq 'length' 2>/dev/null || echo "?")
-  pass "GET /anomalies → $COUNT anomaly(ies) returned"
+  pass "GET /api/anomalies → $COUNT anomaly(ies) returned"
 }
 
 # ── scenario 6: list blame edges ──────────────────────────────────────────────
 scenario_list_blame() {
   info "Scenario 6: List blame edges via REST API"
 
-  RESP=$(curl -sf "$BASE_URL/blame")
-  echo "$RESP" | jq . 2>/dev/null && pass "GET /blame → valid JSON" \
-                                  || { echo "$RESP"; fail "invalid JSON from /blame"; }
+  RESP=$(curl -sf -H "Authorization: Bearer $API_TOKEN" "$BASE_URL/api/blame")
+  echo "$RESP" | jq . 2>/dev/null && pass "GET /api/blame → valid JSON" \
+                                  || { echo "$RESP"; fail "invalid JSON from /api/blame"; }
 }
 
 # ── scenario 7: ping event (GitHub webhook setup) ─────────────────────────────

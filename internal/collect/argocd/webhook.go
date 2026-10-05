@@ -5,26 +5,30 @@ package argocd
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
-
-	"github.com/google/uuid"
 
 	"github.com/prem0x01/costblame/pkg/models"
 )
 
 // WebhookHandler receives ArgoCD application webhook events and emits DeployEvents.
 type WebhookHandler struct {
-	ch chan models.DeployEvent
+	token string
+	ch    chan models.DeployEvent
 }
 
-// New creates a WebhookHandler for ArgoCD application events.
-func New() *WebhookHandler {
-	return &WebhookHandler{ch: make(chan models.DeployEvent, 256)}
+// New creates a WebhookHandler for ArgoCD application events. Requests must
+// carry `Authorization: Bearer <token>`; configure that header on ArgoCD's
+// notifications webhook service. An empty token rejects every request, since an
+// unauthenticated receiver would let anyone inject deploys.
+func New(token string) *WebhookHandler {
+	return &WebhookHandler{token: token, ch: make(chan models.DeployEvent, 256)}
 }
 
 // Name implements collect.DeploySource.
@@ -42,6 +46,11 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !h.authorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -56,6 +65,14 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			slog.Error("argocd: parse webhook", "err", err)
 		}
 	}()
+}
+
+func (h *WebhookHandler) authorized(r *http.Request) bool {
+	if h.token == "" {
+		return false
+	}
+	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	return subtle.ConstantTimeCompare([]byte(got), []byte(h.token)) == 1
 }
 
 // appEvent is the subset of the ArgoCD webhook payload we care about.
@@ -81,7 +98,7 @@ type appEvent struct {
 			Revision string `json:"revision"`
 		} `json:"sync"`
 		OperationState struct {
-			Phase     string `json:"phase"`
+			Phase      string `json:"phase"`
 			FinishedAt string `json:"finishedAt"`
 		} `json:"operationState"`
 		Health struct {
@@ -105,9 +122,16 @@ func (h *WebhookHandler) parse(body []byte) error {
 		occurredAt = ts
 	}
 
+	// One deploy per (app, revision): a resync of the same revision is not new
+	// code. If ArgoCD reports no revision, fall back to the finish time so
+	// distinct syncs don't all collapse into one row.
+	key := []string{ev.Metadata.Name, ev.Status.Sync.Revision}
+	if ev.Status.Sync.Revision == "" {
+		key = append(key, occurredAt.UTC().Format(time.RFC3339))
+	}
 	deploy := models.DeployEvent{
-		ID:          uuid.New(),
-		OccurredAt:  occurredAt,
+		ID:          models.DeployEventID(models.DeploySourceArgoCD, key...),
+		OccurredAt:  occurredAt.UTC(),
 		Source:      models.DeploySourceArgoCD,
 		Repository:  ev.Spec.Source.RepoURL,
 		Branch:      ev.Spec.Source.TargetRevision,

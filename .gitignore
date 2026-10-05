@@ -1,6 +1,7 @@
 # Binaries
 main
 /costblame
+cmd/costblame/costblame
 *.exe
 
 # Database files

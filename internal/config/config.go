@@ -44,6 +44,11 @@ type Config struct {
 type ServerConfig struct {
 	Host string `mapstructure:"host"`
 	Port int    `mapstructure:"port"`
+	// APIToken protects the web UI and /api. Send it as a bearer token, or as
+	// the password in HTTP Basic auth (any username). When empty, `serve`
+	// generates a random token for the run and logs it. Webhook receivers are
+	// not covered — they verify their own signatures.
+	APIToken string `mapstructure:"api_token"`
 }
 
 func (s ServerConfig) Addr() string {
@@ -61,8 +66,8 @@ type DatabaseConfig struct {
 type CostConfig struct {
 	Provider        string        `mapstructure:"provider"`
 	PollInterval    time.Duration `mapstructure:"poll_interval"`
-	LookbackDays    int           `mapstructure:"lookback_days"`              // baseline window for z-score
-	AnomalyMinDelta float64       `mapstructure:"anomaly_min_delta_pct"`      // minimum % increase to flag
+	LookbackDays    int           `mapstructure:"lookback_days"`         // baseline window for z-score
+	AnomalyMinDelta float64       `mapstructure:"anomaly_min_delta_pct"` // minimum % increase to flag
 	AWS             AWSCostConfig `mapstructure:"aws"`
 }
 
@@ -82,11 +87,19 @@ type SourcesConfig struct {
 }
 
 // GitHubSourceConfig holds settings for the GitHub Actions webhook adapter.
-// Enabled when webhook_secret or token is set (or GITHUB_WEBHOOK_SECRET /
-// GITHUB_TOKEN env vars are present).
+// Enabled when webhook_secret is set (or GITHUB_WEBHOOK_SECRET is present);
+// the secret is required because unsigned webhooks would be forgeable. token
+// (or GITHUB_TOKEN) additionally enables PR/changed-files enrichment.
 type GitHubSourceConfig struct {
 	WebhookSecret string `mapstructure:"webhook_secret"`
 	Token         string `mapstructure:"token"`
+	// DeployWorkflows lists the workflows that count as deploys, matched
+	// case-insensitively (with `*` globs) against each run's workflow name and
+	// file path, e.g. ["Deploy", "release.yml"]. Empty treats every successful
+	// push-triggered run on a production branch as a deploy — one per commit —
+	// which over-counts if CI and deploy are separate workflows. Env:
+	// COSTBLAME_SOURCES_GITHUB_DEPLOY_WORKFLOWS="Deploy,Release".
+	DeployWorkflows []string `mapstructure:"deploy_workflows"`
 	// PollInterval, when non-zero, enables fallback API polling instead of webhooks.
 	PollInterval time.Duration `mapstructure:"poll_interval"`
 }
@@ -97,11 +110,13 @@ type GitLabSourceConfig struct {
 	WebhookSecret string `mapstructure:"webhook_secret"`
 }
 
-// ArgoCDSourceConfig holds settings for the ArgoCD webhook adapter.
-// ArgoCD webhooks carry no shared secret, so this one is an explicit opt-in;
-// rely on network-level access control for the endpoint.
+// ArgoCDSourceConfig holds settings for the ArgoCD webhook adapter. It is an
+// explicit opt-in and requires a token: ArgoCD's notifications webhook can send
+// it as an `Authorization: Bearer <token>` header. Without one, anyone who can
+// reach the endpoint could inject fake deploys and frame an author.
 type ArgoCDSourceConfig struct {
-	Enabled bool `mapstructure:"enabled"`
+	Enabled bool   `mapstructure:"enabled"`
+	Token   string `mapstructure:"token"`
 }
 
 // LLMConfig configures narrative generation. Provider selects the adapter:
@@ -145,6 +160,10 @@ type WebhookNotifyConfig struct {
 }
 
 type CorrelationConfig struct {
+	// Interval is how often the correlation engine scores new anomalies.
+	// Independent of cost.poll_interval: Cost Explorer polls cost money per
+	// API call and can run slowly, while correlation is a cheap local query.
+	Interval time.Duration `mapstructure:"interval"`
 	// LookbackWindow is how far back to search for causative deploys.
 	LookbackWindow time.Duration `mapstructure:"lookback_window"`
 	// HighConfidenceThreshold triggers immediate narrative generation and alerting.
@@ -161,6 +180,7 @@ func Load(cfgFile string) (*Config, error) {
 
 	v.SetDefault("server.host", "0.0.0.0")
 	v.SetDefault("server.port", 8080)
+	v.SetDefault("server.api_token", "")
 	v.SetDefault("database.driver", "sqlite")
 	v.SetDefault("database.dsn", "costblame.db")
 	v.SetDefault("cost.provider", "aws")
@@ -171,8 +191,10 @@ func Load(cfgFile string) (*Config, error) {
 	v.SetDefault("cost.aws.granularity", "DAILY")
 	v.SetDefault("sources.github.webhook_secret", "")
 	v.SetDefault("sources.github.token", "")
+	v.SetDefault("sources.github.deploy_workflows", []string{})
 	v.SetDefault("sources.gitlab.webhook_secret", "")
 	v.SetDefault("sources.argocd.enabled", false)
+	v.SetDefault("sources.argocd.token", "")
 	v.SetDefault("llm.provider", "") // empty = auto-detect from environment
 	v.SetDefault("llm.api_key", "")
 	v.SetDefault("llm.model", "")
@@ -182,6 +204,7 @@ func Load(cfgFile string) (*Config, error) {
 	v.SetDefault("notify.slack.min_confidence", 0.65)
 	v.SetDefault("notify.webhook.url", "")
 	v.SetDefault("notify.webhook.min_confidence", 0.65)
+	v.SetDefault("correlation.interval", "1m")
 	v.SetDefault("correlation.lookback_window", "72h")
 	v.SetDefault("correlation.high_confidence_threshold", 0.65)
 	v.SetDefault("correlation.min_score_to_store", 0.10)
@@ -193,8 +216,9 @@ func Load(cfgFile string) (*Config, error) {
 	if cfgFile != "" {
 		v.SetConfigFile(cfgFile)
 	} else {
+		// No SetConfigType here: with an explicit type viper also tries the bare
+		// name "costblame", which in a release archive is the binary itself.
 		v.SetConfigName("costblame")
-		v.SetConfigType("yaml")
 		v.AddConfigPath(".")
 		v.AddConfigPath("$HOME/.costblame")
 		v.AddConfigPath("/etc/costblame")
@@ -236,6 +260,7 @@ func applyEnvFallbacks(cfg *Config) {
 	fallback(&cfg.Sources.GitHub.WebhookSecret, "GITHUB_WEBHOOK_SECRET")
 	fallback(&cfg.Sources.GitHub.Token, "GITHUB_TOKEN")
 	fallback(&cfg.Sources.GitLab.WebhookSecret, "GITLAB_WEBHOOK_SECRET")
+	fallback(&cfg.Sources.ArgoCD.Token, "ARGOCD_WEBHOOK_TOKEN")
 	fallback(&cfg.Notify.Slack.BotToken, "SLACK_BOT_TOKEN")
 	fallback(&cfg.Notify.Slack.Channel, "SLACK_CHANNEL")
 	// LLM provider env vars (ANTHROPIC_API_KEY, OPENAI_API_KEY, OLLAMA_HOST, …)

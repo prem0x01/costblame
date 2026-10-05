@@ -75,12 +75,12 @@ func (n *NoopGenerator) Generate(_ context.Context, edge models.BlameEdge) (stri
 	deploy := edge.DeployEvent
 	return fmt.Sprintf(
 		"Cost for %s increased %.1f%% (%.2f USD → %.2f USD) during the period starting %s. "+
-			"PR #%d (%q by @%s) deployed %s before the spike and is the most likely cause "+
+			"PR #%d (%q by @%s) deployed %s and is the most likely cause "+
 			"with a confidence score of %.0f%%. Review the changes and consider rolling back if the increase was unintended.",
 		snap.Service, snap.DeltaPct, snap.PrevAmountUSD, snap.AmountUSD,
 		snap.PeriodStart.Format("Jan 2 15:04 UTC"),
 		deploy.PRNumber, deploy.PRTitle, deploy.PRAuthor,
-		formatHours(snap.PeriodStart.Sub(deploy.OccurredAt).Hours()),
+		deployTiming(snap.PeriodStart, deploy.OccurredAt),
 		edge.ConfidenceScore*100,
 	), nil
 }

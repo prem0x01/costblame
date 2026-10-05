@@ -13,29 +13,51 @@ import (
 	"github.com/prem0x01/costblame/internal/api/handlers"
 )
 
-// Server is the HTTP server for the REST API and webhook receiver.
+// Server is the HTTP server for the REST API, webhook receiver, and web UI.
 type Server struct {
 	httpServer *http.Server
+}
+
+// webUI is the subset of the web package Server needs — a Register method
+// that mounts UI routes and static assets on the mux. Kept as an interface
+// here so this package doesn't import internal/web directly.
+type webUI interface {
+	Register(mux *http.ServeMux)
 }
 
 // New creates a Server with all routes registered. webhooks maps a source name
 // to its receiver; each is mounted at POST /webhooks/<name>, so any configured
 // deploy source adapter gets an endpoint without the server knowing about it.
+// The JSON REST API lives under /api; ui (if non-nil) gets the clean paths
+// ("/", "/blame", "/anomalies") for the browser UI.
+//
+// Everything except /webhooks/*, /static/* and /healthz requires apiToken
+// (bearer or Basic auth) and, for state-changing methods, a same-origin
+// request — see protect. An empty apiToken locks those routes entirely.
 func New(
 	addr string,
+	apiToken string,
 	store handlers.BlameStore,
 	webhooks map[string]http.Handler,
+	ui webUI,
 ) *Server {
 	mux := http.NewServeMux()
 
 	blame := handlers.NewBlameHandler(store)
 
-	// REST API
-	mux.HandleFunc("GET /blame", blame.ListBlame)
-	mux.HandleFunc("GET /blame/{id}", blame.GetBlame)
-	mux.HandleFunc("POST /blame/{id}/confirm", blame.ConfirmBlame)
-	mux.HandleFunc("POST /blame/{id}/dismiss", blame.DismissBlame)
-	mux.HandleFunc("GET /anomalies", blame.ListAnomalies)
+	// JSON REST API, namespaced under /api so it doesn't collide with the
+	// HTML UI's routes on the same paths (e.g. GET /blame vs GET /api/blame).
+	mux.HandleFunc("GET /api/blame", blame.ListBlame)
+	mux.HandleFunc("GET /api/blame/{id}", blame.GetBlame)
+	mux.HandleFunc("POST /api/blame/{id}/confirm", blame.ConfirmBlame)
+	mux.HandleFunc("POST /api/blame/{id}/dismiss", blame.DismissBlame)
+	mux.HandleFunc("GET /api/anomalies", blame.ListAnomalies)
+	mux.HandleFunc("GET /api/anomalies/{id}/blame", blame.ListBlameForAnomaly)
+
+	// Browser UI — clean paths, server-rendered HTML enhanced with htmx.
+	if ui != nil {
+		ui.Register(mux)
+	}
 
 	// Webhook receivers — one route per configured deploy source.
 	for name, h := range webhooks {
@@ -52,7 +74,7 @@ func New(
 	return &Server{
 		httpServer: &http.Server{
 			Addr:         addr,
-			Handler:      loggingMiddleware(mux),
+			Handler:      loggingMiddleware(securityHeaders(protect(apiToken, mux))),
 			ReadTimeout:  10 * time.Second,
 			WriteTimeout: 30 * time.Second,
 			IdleTimeout:  120 * time.Second,

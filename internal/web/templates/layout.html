@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>costblame</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/htmx.min.js"></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body hx-boost="true">
+  <div class="bg-orbs" aria-hidden="true">
+    <span class="orb orb-a"></span>
+    <span class="orb orb-b"></span>
+    <span class="orb orb-c"></span>
+  </div>
+
+  <input type="checkbox" id="sidebar-toggle" class="sidebar-toggle-input">
+  <label for="sidebar-toggle" class="sidebar-toggle-btn" aria-label="Toggle menu">
+    <span></span><span></span><span></span>
+  </label>
+
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <svg class="logo-mark" width="30" height="30" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect x="1" y="1" width="30" height="30" rx="9" class="logo-bg"/>
+        <path d="M20.5 10.5c-1.1-1-2.6-1.5-4-1.3-2.4.3-4.2 2.4-4.2 4.8 0 2.1 1.3 3.9 3.2 4.6-.9 1.9-2.8 3.2-5 3.2" class="logo-stroke" stroke-width="1.8" stroke-linecap="round" fill="none"/>
+        <path d="M11.5 21.5c1.1 1 2.6 1.5 4 1.3 2.4-.3 4.2-2.4 4.2-4.8 0-2.1-1.3-3.9-3.2-4.6.9-1.9 2.8-3.2 5-3.2" class="logo-stroke" stroke-width="1.8" stroke-linecap="round" fill="none" opacity=".55"/>
+      </svg>
+      <div class="sidebar-brand-text">
+        <span class="wordmark">costblame</span>
+        <span class="tagline">blame the deploy behind the spike</span>
+      </div>
+    </div>
+
+    <nav>
+      <a href="/" class="{{if eq .Active "dashboard"}}active{{end}}">
+        <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M4 13h6V4H4v9Zm0 7h6v-5H4v5Zm10 0h6V11h-6v9Zm0-16v5h6V4h-6Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+        Dashboard
+      </a>
+      <a href="/blame" class="{{if eq .Active "blame"}}active{{end}}">
+        <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M4 6h16M4 12h16M4 18h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        Blame edges
+      </a>
+      <a href="/anomalies" class="{{if eq .Active "anomalies"}}active{{end}}">
+        <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 3 2 20h20L12 3Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 10v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="12" cy="17" r="0.9" fill="currentColor"/></svg>
+        Anomalies
+      </a>
+      <a href="/setup" class="{{if eq .Active "setup"}}active{{end}}">
+        <svg class="nav-icon" width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" stroke="currentColor" stroke-width="1.6"/><path d="M19.4 13.5c.06-.5.06-1 0-1.5l1.7-1.3-1.7-3-2 .6c-.4-.35-.85-.65-1.35-.85l-.3-2.05h-3.5l-.3 2.05c-.5.2-.95.5-1.35.85l-2-.6-1.7 3 1.7 1.3c-.06.5-.06 1 0 1.5l-1.7 1.3 1.7 3 2-.6c.4.35.85.65 1.35.85l.3 2.05h3.5l.3-2.05c.5-.2.95-.5 1.35-.85l2 .6 1.7-3-1.7-1.3Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
+        Setup
+        {{if not .Status.Ready}}<span class="nav-dot"></span>{{end}}
+      </a>
+    </nav>
+
+    <div class="sidebar-status">
+      <div class="sidebar-status-title">System status</div>
+      <div class="status-row">
+        <span class="status-dot {{if .Status.HasCostSource}}status-on{{else}}status-off{{end}}"></span>
+        Cost source
+        <span class="status-value">{{if .Status.HasCostSource}}{{.Status.CostProvider}}{{else}}none{{end}}</span>
+      </div>
+      <div class="status-row">
+        <span class="status-dot {{if .Status.HasDeploySource}}status-on{{else}}status-off{{end}}"></span>
+        Deploy sources
+        <span class="status-value">{{if .Status.HasDeploySource}}{{len .Status.DeploySources}} connected{{else}}none{{end}}</span>
+      </div>
+      <div class="status-row">
+        <span class="status-dot {{if .Status.UsingLLM}}status-on{{else}}status-off{{end}}"></span>
+        Narratives
+        <span class="status-value">{{.Status.NarrativeEngine}}</span>
+      </div>
+      {{if not .Status.Ready}}
+      <a href="/setup" class="setup-link">Finish setup &rarr;</a>
+      {{end}}
+    </div>
+  </aside>
+
+  <main class="page-enter">
+    {{template "content" .}}
+  </main>
+</body>
+</html>

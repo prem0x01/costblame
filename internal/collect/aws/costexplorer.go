@@ -10,7 +10,6 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/costexplorer"
 	cetypes "github.com/aws/aws-sdk-go-v2/service/costexplorer/types"
-	"github.com/google/uuid"
 
 	"github.com/prem0x01/costblame/pkg/models"
 )
@@ -110,8 +109,9 @@ func (s *CESource) Collect(ctx context.Context, from, to time.Time) ([]models.Co
 			deltaPct = ((row.amount - prev) / prev) * 100
 		}
 
+		gran := models.Granularity(s.granularity)
 		snapshots = append(snapshots, models.CostSnapshot{
-			ID:            uuid.New(),
+			ID:            models.SnapshotID(sourceName, row.service, from, to, gran),
 			CollectedAt:   time.Now().UTC(),
 			PeriodStart:   from,
 			PeriodEnd:     to,
@@ -125,7 +125,7 @@ func (s *CESource) Collect(ctx context.Context, from, to time.Time) ([]models.Co
 			DeltaPct:      deltaPct,
 			IsAnomaly:     anomaly,
 			AnomalyScore:  zScore,
-			Granularity:   models.Granularity(s.granularity),
+			Granularity:   gran,
 		})
 	}
 

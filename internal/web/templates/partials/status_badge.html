@@ -1,0 +1,9 @@
+{{define "status_badge.html"}}
+<div id="blame-actions" class="actions">
+  <span class="badge badge-{{.Status}}">{{.Status}}</span>
+  {{if eq .Status "resolved"}}
+    <button class="btn btn-confirm" hx-post="/blame/{{.ID}}/confirm" hx-vals='{"view":"badge"}' hx-target="#blame-actions" hx-swap="outerHTML swap:120ms settle:250ms">Confirm</button>
+    <button class="btn btn-dismiss" hx-post="/blame/{{.ID}}/dismiss" hx-vals='{"view":"badge"}' hx-target="#blame-actions" hx-swap="outerHTML swap:120ms settle:250ms">Dismiss</button>
+  {{end}}
+</div>
+{{end}}

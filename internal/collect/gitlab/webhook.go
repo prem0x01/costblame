@@ -13,8 +13,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/prem0x01/costblame/internal/correlate"
 	"github.com/prem0x01/costblame/pkg/models"
 )
@@ -49,7 +47,8 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := r.Header.Get("X-Gitlab-Token")
-	if h.secret != "" && subtle.ConstantTimeCompare([]byte(token), []byte(h.secret)) == 0 {
+	// An empty secret fails closed: it would accept any request that omits the header.
+	if h.secret == "" || subtle.ConstantTimeCompare([]byte(token), []byte(h.secret)) == 0 {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -108,6 +107,9 @@ func (h *WebhookHandler) parse(body []byte) error {
 	if !isDeployBranch(ev.ObjectAttributes.Ref) {
 		return nil
 	}
+	if ev.ObjectAttributes.SHA == "" {
+		return nil // no commit to key the deploy on
+	}
 
 	occurredAt := time.Now().UTC()
 	if ts, err := time.Parse(time.RFC3339, ev.Commit.Timestamp); err == nil {
@@ -115,8 +117,10 @@ func (h *WebhookHandler) parse(body []byte) error {
 	}
 
 	deploy := models.DeployEvent{
-		ID:          uuid.New(),
-		OccurredAt:  occurredAt,
+		// One deploy per (project, commit): pipeline retries and several
+		// pipelines for one commit merge instead of duplicating.
+		ID:          models.DeployEventID(models.DeploySourceGitLabCI, ev.Project.PathWithNamespace, ev.ObjectAttributes.SHA),
+		OccurredAt:  occurredAt.UTC(),
 		Source:      models.DeploySourceGitLabCI,
 		Repository:  ev.Project.PathWithNamespace,
 		Branch:      ev.ObjectAttributes.Ref,

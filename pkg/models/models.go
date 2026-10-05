@@ -2,6 +2,7 @@ package models
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,9 +29,9 @@ const (
 type DeployStatus string
 
 const (
-	DeployStatusSuccess     DeployStatus = "success"
-	DeployStatusFailure     DeployStatus = "failure"
-	DeployStatusRolledBack  DeployStatus = "rolled_back"
+	DeployStatusSuccess    DeployStatus = "success"
+	DeployStatusFailure    DeployStatus = "failure"
+	DeployStatusRolledBack DeployStatus = "rolled_back"
 )
 
 // BlameStatus tracks the lifecycle of a blame edge from creation to resolution.
@@ -43,6 +44,37 @@ const (
 	BlameStatusDismissed BlameStatus = "dismissed" // user dismissed as false positive
 )
 
+// snapshotNamespace is the UUIDv5 namespace for deterministic snapshot IDs.
+var snapshotNamespace = uuid.MustParse("b71e6e63-5f2c-4a4e-9d5a-3c1f0d9b8a01")
+
+// SnapshotID derives a deterministic ID from a snapshot's natural key
+// (source, service, period, granularity). Collecting the same period twice
+// yields the same ID, so re-polls upsert instead of duplicating rows.
+func SnapshotID(source, service string, periodStart, periodEnd time.Time, gran Granularity) uuid.UUID {
+	key := source + "|" + service + "|" +
+		periodStart.UTC().Format(time.RFC3339) + "|" +
+		periodEnd.UTC().Format(time.RFC3339) + "|" +
+		string(gran)
+	return uuid.NewSHA1(snapshotNamespace, []byte(key))
+}
+
+// deployNamespace is the UUIDv5 namespace for deterministic deploy event IDs.
+var deployNamespace = uuid.MustParse("5d0c2a61-7f1e-4b0a-8c3d-2e9b6f4a1c72")
+
+// DeployEventID derives a deterministic ID from a deploy's natural key, e.g.
+// (repository, commit SHA). Webhook redeliveries, several workflows finishing
+// for one commit, and the two-phase enrichment all resolve to the same ID, so
+// the store upserts one row per deploy instead of inserting duplicates that
+// would each become a separate blame candidate.
+//
+// Trade-off: re-deploying the same commit (or an ArgoCD resync of the same
+// revision) maps onto the original row. That is intended — the code did not
+// change, so it is not a new candidate cause for a later cost spike.
+func DeployEventID(source DeploySource, parts ...string) uuid.UUID {
+	key := string(source) + "|" + strings.Join(parts, "|")
+	return uuid.NewSHA1(deployNamespace, []byte(strings.ToLower(key)))
+}
+
 // CostSnapshot is a point-in-time cost reading for one service/tag combination.
 // It captures both the raw amount and its delta vs. the previous equivalent period,
 // along with an anomaly score expressed as standard deviations from the rolling baseline.
@@ -51,8 +83,8 @@ type CostSnapshot struct {
 	CollectedAt   time.Time         `db:"collected_at"   json:"collected_at"`
 	PeriodStart   time.Time         `db:"period_start"   json:"period_start"`
 	PeriodEnd     time.Time         `db:"period_end"     json:"period_end"`
-	Source        string            `db:"source"         json:"source"`        // "aws", "gcp"
-	Service       string            `db:"service"        json:"service"`       // "AmazonECS"
+	Source        string            `db:"source"         json:"source"`  // "aws", "gcp"
+	Service       string            `db:"service"        json:"service"` // "AmazonECS"
 	Region        string            `db:"region"         json:"region"`
 	Tags          map[string]string `db:"tags"           json:"tags"`
 	AmountUSD     float64           `db:"amount_usd"     json:"amount_usd"`
@@ -68,22 +100,25 @@ type CostSnapshot struct {
 // ChangedFiles and InferredServices are populated asynchronously after the initial
 // webhook ack — the correlation engine re-reads enriched records before scoring.
 type DeployEvent struct {
-	ID               uuid.UUID       `db:"id"                json:"id"`
-	OccurredAt       time.Time       `db:"occurred_at"       json:"occurred_at"`
-	Source           DeploySource    `db:"source"            json:"source"`
-	Repository       string          `db:"repository"        json:"repository"`
-	Branch           string          `db:"branch"            json:"branch"`
-	CommitSHA        string          `db:"commit_sha"        json:"commit_sha"`
-	PRNumber         int             `db:"pr_number"         json:"pr_number"`
-	PRTitle          string          `db:"pr_title"          json:"pr_title"`
-	PRAuthor         string          `db:"pr_author"         json:"pr_author"`
-	PRTeam           string          `db:"pr_team"           json:"pr_team"`
-	PRLabels         []string        `db:"pr_labels"         json:"pr_labels"`
-	ChangedFiles     []string        `db:"changed_files"     json:"changed_files"`
-	InferredServices []string        `db:"inferred_services" json:"inferred_services"`
-	Environment      string          `db:"environment"       json:"environment"` // "prod", "staging"
-	Status           DeployStatus    `db:"status"            json:"status"`
-	RawPayload       json.RawMessage `db:"raw_payload"       json:"raw_payload"`
+	ID               uuid.UUID    `db:"id"                json:"id"`
+	OccurredAt       time.Time    `db:"occurred_at"       json:"occurred_at"`
+	Source           DeploySource `db:"source"            json:"source"`
+	Repository       string       `db:"repository"        json:"repository"`
+	Branch           string       `db:"branch"            json:"branch"`
+	CommitSHA        string       `db:"commit_sha"        json:"commit_sha"`
+	PRNumber         int          `db:"pr_number"         json:"pr_number"`
+	PRTitle          string       `db:"pr_title"          json:"pr_title"`
+	PRAuthor         string       `db:"pr_author"         json:"pr_author"`
+	PRTeam           string       `db:"pr_team"           json:"pr_team"`
+	PRLabels         []string     `db:"pr_labels"         json:"pr_labels"`
+	ChangedFiles     []string     `db:"changed_files"     json:"changed_files"`
+	InferredServices []string     `db:"inferred_services" json:"inferred_services"`
+	Environment      string       `db:"environment"       json:"environment"` // "prod", "staging"
+	Status           DeployStatus `db:"status"            json:"status"`
+	// RawPayload is persisted for debugging but never serialized: it can hold
+	// full webhook bodies (emails, internal repo URLs) and the JSON API must
+	// not hand those out.
+	RawPayload json.RawMessage `db:"raw_payload" json:"-"`
 }
 
 // ConfidenceFactor is one scored signal that contributes to the overall blame score.
@@ -114,7 +149,7 @@ type BlameEdge struct {
 // BlameGraph is the complete causal chain for a single cost anomaly.
 // Edges are sorted descending by ConfidenceScore; TopBlame is edges[0].
 type BlameGraph struct {
-	ID          uuid.UUID   `json:"id"`
+	ID          uuid.UUID    `json:"id"`
 	Anomaly     CostSnapshot `json:"anomaly"`
 	Edges       []BlameEdge  `json:"edges"`
 	TopBlame    *BlameEdge   `json:"top_blame,omitempty"`

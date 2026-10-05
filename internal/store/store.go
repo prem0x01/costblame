@@ -15,14 +15,24 @@ import (
 type Store interface {
 	// --- CostSnapshot ---
 
-	// SaveCostSnapshot persists a new cost snapshot. Duplicate IDs are ignored.
+	// SaveCostSnapshot persists a cost snapshot. An existing row with the same ID
+	// has its amounts and anomaly fields refreshed (re-polls of the same period
+	// upsert rather than duplicate).
 	SaveCostSnapshot(ctx context.Context, s models.CostSnapshot) error
 
-	// SaveCostSnapshots bulk-inserts cost snapshots. Duplicate IDs are ignored.
+	// SaveCostSnapshots bulk-upserts cost snapshots (see SaveCostSnapshot).
 	SaveCostSnapshots(ctx context.Context, ss []models.CostSnapshot) error
 
 	// UnblamedAnomalies returns anomalous cost snapshots that have no BlameEdge yet.
 	UnblamedAnomalies(ctx context.Context) ([]models.CostSnapshot, error)
+
+	// UnscoredAnomalies returns anomalous cost snapshots the correlation engine
+	// has not yet processed (scored_at IS NULL).
+	UnscoredAnomalies(ctx context.Context) ([]models.CostSnapshot, error)
+
+	// MarkAnomalyScored records that the correlation engine has processed the
+	// anomaly, whether or not any blame edges resulted.
+	MarkAnomalyScored(ctx context.Context, id uuid.UUID) error
 
 	// CostSnapshotsByService returns snapshots for a service, sorted ascending by PeriodStart.
 	CostSnapshotsByService(ctx context.Context, service string, from, to time.Time) ([]models.CostSnapshot, error)
@@ -44,6 +54,14 @@ type Store interface {
 
 	// UpdateBlameEdge updates the narrative, status, and confidence score of an existing edge.
 	UpdateBlameEdge(ctx context.Context, edge models.BlameEdge) error
+
+	// UpdateBlameStatus changes only the status of an existing edge, leaving
+	// narrative, score, and factors intact. Returns sql.ErrNoRows if no edge
+	// with that ID exists.
+	UpdateBlameStatus(ctx context.Context, id uuid.UUID, status models.BlameStatus) error
+
+	// BlameEdgeByID returns a single edge by its own ID, or sql.ErrNoRows.
+	BlameEdgeByID(ctx context.Context, id uuid.UUID) (*models.BlameEdge, error)
 
 	// BlameEdgesBySnapshot returns all edges for a cost snapshot, sorted by ConfidenceScore desc.
 	BlameEdgesBySnapshot(ctx context.Context, snapshotID uuid.UUID) ([]models.BlameEdge, error)

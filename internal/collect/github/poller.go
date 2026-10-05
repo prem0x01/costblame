@@ -11,8 +11,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/prem0x01/costblame/internal/correlate"
 	"github.com/prem0x01/costblame/pkg/models"
 )
 
@@ -74,7 +72,7 @@ func (p *Poller) poll(ctx context.Context) {
 			if run.Status != "completed" || run.Conclusion != "success" {
 				continue
 			}
-			if !isDeployBranch(run.HeadBranch) {
+			if !isDeployRun(run, nil) {
 				continue
 			}
 			if !run.UpdatedAt.After(cutoff) {
@@ -83,31 +81,17 @@ func (p *Poller) poll(ctx context.Context) {
 			if run.UpdatedAt.After(newest) {
 				newest = run.UpdatedAt
 			}
-			event := models.DeployEvent{
-				ID:          uuid.New(),
-				OccurredAt:  run.UpdatedAt,
-				Source:      models.DeploySourceGitHubActions,
-				Repository:  repo,
-				Branch:      run.HeadBranch,
-				CommitSHA:   run.HeadSHA,
-				Environment: inferEnvironment(run.HeadBranch),
-				Status:      models.DeployStatusSuccess,
-			}
+			event := eventFromRun(repo, run)
 			raw, _ := json.Marshal(run)
 			event.RawPayload = raw
 
 			// Enrich inline for the poller — latency is less critical.
 			e := newEnricher(p.token)
-			payload := WorkflowRunPayload{
-				WorkflowRun: run,
-				Repository:  Repository{FullName: repo},
-			}
-			enriched, err := e.Enrich(ctx, event, payload)
+			enriched, err := e.Enrich(ctx, event, prHint(run))
 			if err != nil {
 				slog.Warn("github poller: enrichment failed", "err", err)
 				enriched = &event
 			}
-			enriched.InferredServices = correlate.InferServicesFromFiles(enriched.ChangedFiles)
 			select {
 			case p.events <- *enriched:
 			case <-ctx.Done():

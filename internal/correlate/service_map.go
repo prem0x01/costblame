@@ -22,7 +22,7 @@ var defaultPatterns = []servicePattern{
 	{"terraform/sns", "AmazonSNS"},
 	{"terraform/eks", "AmazonEKS"},
 	{"terraform/ec2", "AmazonEC2"},
-	{"terraform/alb", "AmazonEC2"},    // ALB costs appear under EC2
+	{"terraform/alb", "AmazonEC2"}, // ALB costs appear under EC2
 	{"terraform/nlb", "AmazonEC2"},
 	{"terraform/dynamodb", "AmazonDynamoDB"},
 	{"terraform/kinesis", "AmazonKinesis"},

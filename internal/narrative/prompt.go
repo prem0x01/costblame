@@ -93,7 +93,7 @@ COST ANOMALY
 MOST LIKELY DEPLOYMENT
   PR #%d     : "%s"
   Author     : @%s (%s team)
-  Deployed   : %s (%s before spike)
+  Deployed   : %s (%s)
   Environment: %s
   Changed files (first 5): %s
 
@@ -108,7 +108,7 @@ CORRELATION SIGNALS
 		bc.PRNumber, bc.PRTitle,
 		bc.PRAuthor, bc.PRTeam,
 		bc.DeployTime.Format("Jan 2 15:04 UTC"),
-		formatHours(bc.HoursApart),
+		deployTiming(bc.PeriodStart, bc.DeployTime),
 		bc.Environment,
 		formatFiles(bc.ChangedFiles, 5),
 		formatFactors(bc.ConfidenceFactors),
@@ -133,6 +133,17 @@ func formatHours(h float64) string {
 		return fmt.Sprintf("%.0f minutes", h*60)
 	}
 	return fmt.Sprintf("%.1f hours", h)
+}
+
+// deployTiming describes when a deploy happened relative to the cost period.
+// Deploys made during the period are common (a DAILY period is a whole UTC
+// day), so a negative offset reads "into the period" rather than "-3 hours".
+func deployTiming(periodStart, deployTime time.Time) string {
+	h := periodStart.Sub(deployTime).Hours()
+	if h < 0 {
+		return formatHours(-h) + " into the cost period"
+	}
+	return formatHours(h) + " before the cost period began"
 }
 
 func formatFiles(files []string, max int) string {

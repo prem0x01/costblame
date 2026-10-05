@@ -10,32 +10,44 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"path"
 	"strings"
 	"time"
-
-	"github.com/google/uuid"
+	"unicode"
 
 	"github.com/prem0x01/costblame/internal/correlate"
 	"github.com/prem0x01/costblame/pkg/models"
 )
 
 // WebhookHandler receives GitHub webhook events and converts them to DeployEvents.
-// It must be registered on the `workflow_run` and `deployment_status` event types
+// Register it for the `workflow_run` event and, optionally, `deployment_status`
 // in the GitHub webhook settings.
+//
+// One commit is one deploy: every event kind and every workflow for a commit
+// resolves to the same deterministic ID (see models.DeployEventID), and the
+// store merges them. GitHub redeliveries are therefore idempotent.
 type WebhookHandler struct {
-	secret   []byte
-	events   chan models.DeployEvent
-	enricher *enricher
+	secret    []byte
+	workflows []string // deploy workflow name/path patterns; empty = any workflow
+	events    chan models.DeployEvent
+	enricher  *enricher // nil without a token: PR enrichment is off
 }
 
-// NewWebhookHandler creates a handler that validates HMAC signatures using secret
-// and uses ghToken to fetch enrichment data (changed files, PR info) from GitHub API.
-func NewWebhookHandler(secret, ghToken string) *WebhookHandler {
-	return &WebhookHandler{
-		secret:   []byte(secret),
-		events:   make(chan models.DeployEvent, 256),
-		enricher: newEnricher(ghToken),
+// NewWebhookHandler creates a handler that validates HMAC signatures using secret.
+// A non-empty ghToken enables PR/changed-file enrichment via the GitHub API;
+// without one, events are stored with no PR metadata. deployWorkflows restricts
+// which workflows count as deploys (matched case-insensitively, with `*` globs,
+// against the workflow's name and file path); empty accepts any workflow.
+func NewWebhookHandler(secret, ghToken string, deployWorkflows []string) *WebhookHandler {
+	h := &WebhookHandler{
+		secret:    []byte(secret),
+		workflows: cleanPatterns(deployWorkflows),
+		events:    make(chan models.DeployEvent, 256),
 	}
+	if ghToken != "" {
+		h.enricher = newEnricher(ghToken)
+	}
+	return h
 }
 
 // Name implements collect.DeploySource.
@@ -65,72 +77,257 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	eventType := r.Header.Get("X-GitHub-Event")
-	switch eventType {
+	status := http.StatusAccepted // also for event types we deliberately ignore
+	switch r.Header.Get("X-GitHub-Event") {
 	case "workflow_run":
-		h.handleWorkflowRun(r.Context(), body)
+		status = h.handleWorkflowRun(body)
+	case "deployment_status":
+		status = h.handleDeploymentStatus(body)
 	case "ping":
-		w.WriteHeader(http.StatusOK)
-		return
-	default:
-		// Accept but ignore other event types GitHub may send.
+		status = http.StatusOK
 	}
 
-	w.WriteHeader(http.StatusAccepted)
+	switch status {
+	case http.StatusServiceUnavailable:
+		// The event was NOT queued. The delivery shows as failed in the webhook's
+		// "Recent Deliveries"; redelivering it (UI or API) is safe because deploy
+		// IDs are deterministic, so it cannot create a duplicate.
+		w.Header().Set("Retry-After", "30")
+		http.Error(w, "event queue full, retry later", status)
+	case http.StatusBadRequest:
+		http.Error(w, "malformed payload", status)
+	default:
+		w.WriteHeader(status)
+	}
 }
 
-func (h *WebhookHandler) handleWorkflowRun(ctx context.Context, body []byte) {
+func (h *WebhookHandler) handleWorkflowRun(body []byte) int {
 	var payload WorkflowRunPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		slog.Warn("github: failed to parse workflow_run payload", "err", err)
-		return
+		return http.StatusBadRequest
 	}
 
-	// Only process completed successful runs; ignore in-progress or failed runs.
-	if payload.WorkflowRun.Status != "completed" || payload.WorkflowRun.Conclusion != "success" {
-		return
+	run := payload.WorkflowRun
+	// Only completed successful runs of something that is actually a deploy.
+	if run.Status != "completed" || run.Conclusion != "success" || !isDeployRun(run, h.workflows) {
+		return http.StatusAccepted
 	}
 
-	// Only consider runs on branches that look like production deployments.
-	if !isDeployBranch(payload.WorkflowRun.HeadBranch) {
-		return
+	event := eventFromRun(payload.Repository.FullName, run)
+	event.RawPayload = body
+	return h.dispatch(event, prHint(run))
+}
+
+// handleDeploymentStatus handles GitHub's Deployments API: the canonical deploy
+// signal for teams that use it. Only successful production deployments count —
+// a staging deploy of the same commit must not set the deploy time, because
+// events for one commit merge into one row.
+func (h *WebhookHandler) handleDeploymentStatus(body []byte) int {
+	var p DeploymentStatusPayload
+	if err := json.Unmarshal(body, &p); err != nil {
+		slog.Warn("github: failed to parse deployment_status payload", "err", err)
+		return http.StatusBadRequest
 	}
 
+	if p.DeploymentStatus.State != "success" || p.Deployment.SHA == "" || p.Repository.FullName == "" ||
+		!isProductionEnvironment(p.Deployment.Environment) {
+		return http.StatusAccepted
+	}
+
+	occurredAt := p.DeploymentStatus.CreatedAt
+	if occurredAt.IsZero() {
+		occurredAt = time.Now().UTC()
+	}
 	event := models.DeployEvent{
-		ID:          uuid.New(),
-		OccurredAt:  payload.WorkflowRun.UpdatedAt,
+		ID:          models.DeployEventID(models.DeploySourceGitHubActions, p.Repository.FullName, p.Deployment.SHA),
+		OccurredAt:  occurredAt.UTC(),
 		Source:      models.DeploySourceGitHubActions,
-		Repository:  payload.Repository.FullName,
-		Branch:      payload.WorkflowRun.HeadBranch,
-		CommitSHA:   payload.WorkflowRun.HeadSHA,
-		Environment: inferEnvironment(payload.WorkflowRun.HeadBranch),
+		Repository:  p.Repository.FullName,
+		Branch:      p.Deployment.Ref,
+		CommitSHA:   p.Deployment.SHA,
+		Environment: p.Deployment.Environment,
 		Status:      models.DeployStatusSuccess,
 		RawPayload:  body,
 	}
-
-	// Acknowledge immediately; enrich asynchronously.
-	h.events <- event
-
-	// Enrichment fetches PR details and changed files from GitHub API.
-	// The result is re-sent on the channel as an upsert — the store layer
-	// merges enriched fields by ID.
-	go h.enrichAsync(event, payload)
+	return h.dispatch(event, 0)
 }
 
-func (h *WebhookHandler) enrichAsync(event models.DeployEvent, payload WorkflowRunPayload) {
+// dispatch queues the event without blocking the webhook response and, when a
+// token is configured, starts background PR enrichment. It returns 202, or 503
+// when the queue is full.
+func (h *WebhookHandler) dispatch(event models.DeployEvent, prHint int) int {
+	select {
+	case h.events <- event:
+	default:
+		slog.Warn("github: event queue full, asking sender to retry",
+			"repo", event.Repository, "commit", event.CommitSHA)
+		return http.StatusServiceUnavailable
+	}
+
+	if h.enricher != nil {
+		go h.enrichAsync(event, prHint)
+	}
+	return http.StatusAccepted
+}
+
+func (h *WebhookHandler) enrichAsync(event models.DeployEvent, prHint int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	enriched, err := h.enricher.Enrich(ctx, event, payload)
+	enriched, err := h.enricher.Enrich(ctx, event, prHint)
 	if err != nil {
 		slog.Warn("github: enrichment failed", "repo", event.Repository, "commit", event.CommitSHA, "err", err)
 		return
 	}
+	if enriched.PRNumber == 0 {
+		return // no PR found; nothing to add to the stored event
+	}
 
-	h.events <- *enriched
+	// The enriched copy has the same ID, so the store merges it into the
+	// original row. Bounded by ctx so this goroutine can't block forever if
+	// the consumer has stopped (shutdown).
+	select {
+	case h.events <- *enriched:
+	case <-ctx.Done():
+		slog.Warn("github: dropping enrichment, event queue stayed full", "repo", event.Repository, "commit", event.CommitSHA)
+	}
+}
+
+// eventFromRun builds the (unenriched) DeployEvent for a workflow run. The ID
+// depends only on repository and commit, never on the delivery or the run.
+func eventFromRun(repo string, run WorkflowRun) models.DeployEvent {
+	return models.DeployEvent{
+		ID:          models.DeployEventID(models.DeploySourceGitHubActions, repo, run.HeadSHA),
+		OccurredAt:  run.UpdatedAt.UTC(),
+		Source:      models.DeploySourceGitHubActions,
+		Repository:  repo,
+		Branch:      run.HeadBranch,
+		CommitSHA:   run.HeadSHA,
+		Environment: inferEnvironment(run.HeadBranch),
+		Status:      models.DeployStatusSuccess,
+	}
+}
+
+func prHint(run WorkflowRun) int {
+	if len(run.PullRequests) > 0 {
+		return run.PullRequests[0].Number
+	}
+	return 0
+}
+
+// deployTriggers are the workflow triggers that can mean "new code reached
+// production". Everything else — notably `schedule` and the pull_request
+// family — is excluded: scheduled runs execute against whatever HEAD is,
+// possibly days old, and PR runs are not deploys at all.
+//
+// "workflow_run" is included on purpose: a deploy workflow chained off CI
+// (`on: workflow_run: workflows: [CI]`) reports exactly that trigger. Without it
+// the commonest CI→deploy layout would record no deploys at all. It is safe
+// because the branch filter still applies and the store keeps the earliest time.
+var deployTriggers = map[string]bool{
+	"push":                true,
+	"workflow_dispatch":   true,
+	"repository_dispatch": true,
+	"release":             true,
+	"workflow_run":        true,
+}
+
+// isDeployRun reports whether a (completed, successful) workflow run should
+// count as a deploy: a deploy-like trigger, a production branch, and, when
+// patterns are configured, a matching workflow name or file path.
+func isDeployRun(run WorkflowRun, patterns []string) bool {
+	return deployTriggers[run.Event] &&
+		isDeployBranch(run.HeadBranch) &&
+		matchesWorkflow(run, patterns)
+}
+
+// matchesWorkflow reports whether run's workflow name or file path (full path
+// or base name) matches any pattern. No patterns means every workflow matches.
+func matchesWorkflow(run WorkflowRun, patterns []string) bool {
+	if len(patterns) == 0 {
+		return true
+	}
+	file := run.Path
+	if i := strings.IndexByte(file, '@'); i >= 0 {
+		file = file[:i] // strip the "@refs/heads/main" suffix
+	}
+	candidates := []string{run.Name, file, path.Base(file)}
+	for _, pat := range patterns {
+		for _, c := range candidates {
+			if c != "" && globFold(pat, c) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// globFold is a case-insensitive path.Match that falls back to plain equality
+// for a malformed pattern.
+func globFold(pattern, name string) bool {
+	pattern, name = strings.ToLower(pattern), strings.ToLower(name)
+	if ok, err := path.Match(pattern, name); err == nil {
+		return ok
+	}
+	return pattern == name
+}
+
+func cleanPatterns(in []string) []string {
+	var out []string
+	for _, p := range in {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// isProductionEnvironment reports whether a Deployments API environment name
+// looks like production: "production", "prod", "prod-eu", "prod2", "live".
+// It works on whole words, so "preprod", "pre-production", "non-prod" and
+// "nonprod" — all staging in practice — are rejected even though they contain
+// "prod".
+func isProductionEnvironment(env string) bool {
+	isProd := false
+	for _, w := range strings.FieldsFunc(strings.ToLower(env), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if (strings.HasPrefix(w, "pre") || strings.HasPrefix(w, "non")) && strings.Contains(w, "prod") {
+			return false // "preprod", "nonprod", "preproduction"
+		}
+		switch w {
+		case "pre", "non", "staging", "stage", "stg", "dev", "test", "qa", "uat", "sandbox", "preview":
+			return false
+		case "prod", "production", "live":
+			isProd = true
+		default:
+			if rest, ok := strings.CutPrefix(w, "prod"); ok && isDigits(rest) {
+				isProd = true // "prod1", "prod2"
+			}
+		}
+	}
+	return isProd
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *WebhookHandler) verifySignature(sigHeader string, body []byte) bool {
+	// Never accept unsigned traffic: an HMAC keyed with an empty secret is
+	// computable by anyone, so an empty secret must fail closed.
+	if len(h.secret) == 0 {
+		return false
+	}
 	if !strings.HasPrefix(sigHeader, "sha256=") {
 		return false
 	}
@@ -180,25 +377,27 @@ func newEnricher(token string) *enricher {
 	}
 }
 
-func (e *enricher) Enrich(ctx context.Context, event models.DeployEvent, payload WorkflowRunPayload) (*models.DeployEvent, error) {
-	// Use PR numbers embedded in the workflow_run payload if available.
-	var prNumber int
-	if len(payload.WorkflowRun.PullRequests) > 0 {
-		prNumber = payload.WorkflowRun.PullRequests[0].Number
-	} else {
+// Enrich fills in PR metadata and changed files for event's commit. prHint is a
+// PR number already known from the payload (0 = look it up by commit). When no
+// PR can be found the event is returned unchanged (PRNumber == 0).
+func (e *enricher) Enrich(ctx context.Context, event models.DeployEvent, prHint int) (*models.DeployEvent, error) {
+	repo, sha := event.Repository, event.CommitSHA
+
+	prNumber := prHint
+	if prNumber == 0 {
 		var err error
-		prNumber, err = e.findPRForCommit(ctx, payload.Repository.FullName, payload.WorkflowRun.HeadSHA)
+		prNumber, err = e.findPRForCommit(ctx, repo, sha)
 		if err != nil || prNumber == 0 {
 			return &event, nil // no PR found — return unenriched event
 		}
 	}
 
-	pr, err := e.fetchPR(ctx, payload.Repository.FullName, prNumber)
+	pr, err := e.fetchPR(ctx, repo, prNumber)
 	if err != nil {
 		return &event, fmt.Errorf("fetching PR: %w", err)
 	}
 
-	files, err := e.fetchChangedFiles(ctx, payload.Repository.FullName, prNumber)
+	files, err := e.fetchChangedFiles(ctx, repo, prNumber)
 	if err != nil {
 		slog.Warn("github: failed to fetch changed files", "pr", prNumber, "err", err)
 	}

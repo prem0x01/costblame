@@ -20,7 +20,8 @@ const CandidateWindow = 72 * time.Hour
 // EngineStore is the subset of store.Store that the Engine requires.
 // Using a narrow interface keeps the engine testable without a real database.
 type EngineStore interface {
-	UnblamedAnomalies(ctx context.Context) ([]models.CostSnapshot, error)
+	UnscoredAnomalies(ctx context.Context) ([]models.CostSnapshot, error)
+	MarkAnomalyScored(ctx context.Context, id uuid.UUID) error
 	DeploysBetween(ctx context.Context, from, to time.Time) ([]models.DeployEvent, error)
 	SaveBlameEdges(ctx context.Context, edges []models.BlameEdge) error
 	UpdateBlameEdge(ctx context.Context, edge models.BlameEdge) error
@@ -56,6 +57,9 @@ func NewEngine(
 	interval time.Duration,
 	minScore float64,
 ) *Engine {
+	if interval <= 0 {
+		interval = time.Minute
+	}
 	return &Engine{
 		store:     store,
 		scorer:    NewScorer(&storeHistoryAdapter{store: store}),
@@ -88,31 +92,45 @@ func (e *Engine) Run(ctx context.Context) {
 	}
 }
 
-// correlateNew processes all anomalies that don't yet have blame edges.
+// correlateNew processes all anomalies the engine hasn't scored yet.
 func (e *Engine) correlateNew(ctx context.Context) error {
-	anomalies, err := e.store.UnblamedAnomalies(ctx)
+	anomalies, err := e.store.UnscoredAnomalies(ctx)
 	if err != nil {
-		return fmt.Errorf("fetching unblamed anomalies: %w", err)
+		return fmt.Errorf("fetching unscored anomalies: %w", err)
 	}
 
 	if len(anomalies) == 0 {
 		return nil
 	}
 
-	slog.Info("correlation cycle", "unblamed_anomalies", len(anomalies))
+	slog.Info("correlation cycle", "unscored_anomalies", len(anomalies))
 
 	for _, anomaly := range anomalies {
 		if err := e.processAnomaly(ctx, anomaly); err != nil {
 			slog.Error("processing anomaly", "anomaly_id", anomaly.ID, "err", err)
-			// Continue processing other anomalies — one bad record shouldn't halt everything.
+			// Continue processing other anomalies — one bad record shouldn't halt
+			// everything. The anomaly stays unscored and is retried next cycle.
+			continue
+		}
+		// Mark scored even when no edges resulted, so anomalies with no
+		// qualifying deploys aren't reprocessed on every cycle forever.
+		if err := e.store.MarkAnomalyScored(ctx, anomaly.ID); err != nil {
+			slog.Error("marking anomaly scored", "anomaly_id", anomaly.ID, "err", err)
 		}
 	}
 	return nil
 }
 
 func (e *Engine) processAnomaly(ctx context.Context, anomaly models.CostSnapshot) error {
+	// The window runs through PeriodEnd, not PeriodStart: a billing period is a
+	// bucket (a full UTC day for DAILY data), so deploys made during the period
+	// are the most likely cause of its spike.
 	windowStart := anomaly.PeriodStart.Add(-CandidateWindow)
-	candidates, err := e.store.DeploysBetween(ctx, windowStart, anomaly.PeriodStart)
+	windowEnd := anomaly.PeriodEnd
+	if windowEnd.Before(anomaly.PeriodStart) {
+		windowEnd = anomaly.PeriodStart
+	}
+	candidates, err := e.store.DeploysBetween(ctx, windowStart, windowEnd)
 	if err != nil {
 		return fmt.Errorf("fetching candidate deploys: %w", err)
 	}
@@ -125,7 +143,7 @@ func (e *Engine) processAnomaly(ctx context.Context, anomaly models.CostSnapshot
 	// Score each candidate and discard below-threshold edges.
 	edges := make([]models.BlameEdge, 0, len(candidates))
 	for _, deploy := range candidates {
-		factors := e.scorer.Score(anomaly, deploy)
+		factors := e.scorer.Score(ctx, anomaly, deploy)
 		score := e.scorer.TotalScore(factors)
 
 		if score < e.minScore {
@@ -208,9 +226,11 @@ type storeHistoryAdapter struct {
 	store EngineStore
 }
 
-func (a *storeHistoryAdapter) ConfirmedBlameCount(author, service string) int {
-	count, err := a.store.ConfirmedBlameCount(context.Background(), author, service)
+func (a *storeHistoryAdapter) ConfirmedBlameCount(ctx context.Context, author, service string) int {
+	count, err := a.store.ConfirmedBlameCount(ctx, author, service)
 	if err != nil {
+		slog.Warn("confirmed blame count lookup failed — historical factor scores 0",
+			"author", author, "service", service, "err", err)
 		return 0
 	}
 	return count

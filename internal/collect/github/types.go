@@ -10,8 +10,13 @@ type WorkflowRunPayload struct {
 }
 
 type WorkflowRun struct {
-	ID           int64     `json:"id"`
-	Name         string    `json:"name"`
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+	// Path is the workflow file, e.g. ".github/workflows/deploy.yml" (sometimes
+	// suffixed "@refs/heads/main"). Unlike Name it is stable across renames.
+	Path string `json:"path"`
+	// Event is what triggered the run: push, schedule, pull_request, ...
+	Event        string    `json:"event"`
 	Status       string    `json:"status"`
 	Conclusion   string    `json:"conclusion"`
 	HeadBranch   string    `json:"head_branch"`
@@ -19,6 +24,21 @@ type WorkflowRun struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 	HTMLURL      string    `json:"html_url"`
 	PullRequests []PRRef   `json:"pull_requests"`
+}
+
+// DeploymentStatusPayload is the webhook payload for the `deployment_status`
+// event, which GitHub emits when a deployment changes state.
+type DeploymentStatusPayload struct {
+	DeploymentStatus struct {
+		State     string    `json:"state"`
+		CreatedAt time.Time `json:"created_at"`
+	} `json:"deployment_status"`
+	Deployment struct {
+		SHA         string `json:"sha"`
+		Ref         string `json:"ref"` // may be a branch, a tag, or a SHA
+		Environment string `json:"environment"`
+	} `json:"deployment"`
+	Repository Repository `json:"repository"`
 }
 
 type PRRef struct {
@@ -32,13 +52,13 @@ type Repository struct {
 
 // PullRequest is the GitHub REST API response for a single PR.
 type PullRequest struct {
-	Number int    `json:"number"`
-	Title  string `json:"title"`
-	Body   string `json:"body"`
-	User   User   `json:"user"`
+	Number int     `json:"number"`
+	Title  string  `json:"title"`
+	Body   string  `json:"body"`
+	User   User    `json:"user"`
 	Labels []Label `json:"labels"`
-	Head   Ref    `json:"head"`
-	Base   Ref    `json:"base"`
+	Head   Ref     `json:"head"`
+	Base   Ref     `json:"base"`
 }
 
 type User struct {

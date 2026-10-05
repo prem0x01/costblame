@@ -1,6 +1,7 @@
 package correlate
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -9,7 +10,7 @@ import (
 
 type fakeHistory struct{ count int }
 
-func (f *fakeHistory) ConfirmedBlameCount(_, _ string) int { return f.count }
+func (f *fakeHistory) ConfirmedBlameCount(_ context.Context, _, _ string) int { return f.count }
 
 func TestTemporalScore(t *testing.T) {
 	s := NewScorer(&fakeHistory{})
@@ -31,7 +32,7 @@ func TestTemporalScore(t *testing.T) {
 	snap := models.CostSnapshot{Service: "AmazonEC2", PeriodStart: now}
 	for _, tc := range cases {
 		deploy := models.DeployEvent{OccurredAt: now.Add(-tc.delta)}
-		factors := s.Score(snap, deploy)
+		factors := s.Score(context.Background(), snap, deploy)
 
 		var temporal float64
 		for _, f := range factors {
@@ -58,8 +59,8 @@ func TestServiceMatchScore(t *testing.T) {
 	matchSnap := models.CostSnapshot{Service: "AmazonEC2"}
 	noMatchSnap := models.CostSnapshot{Service: "AmazonRDS"}
 
-	factorsMatch := s.Score(matchSnap, deploy)
-	factorsNoMatch := s.Score(noMatchSnap, deploy)
+	factorsMatch := s.Score(context.Background(), matchSnap, deploy)
+	factorsNoMatch := s.Score(context.Background(), noMatchSnap, deploy)
 
 	scoreOf := func(factors []models.ConfidenceFactor, name string) float64 {
 		for _, f := range factors {
@@ -86,7 +87,7 @@ func TestTotalScore_HighConfidenceThreshold(t *testing.T) {
 		Repository:       "my-lambda-worker",
 	}
 
-	factors := s.Score(snap, deploy)
+	factors := s.Score(context.Background(), snap, deploy)
 	total := s.TotalScore(factors)
 
 	if total < HighConfidenceThreshold {
@@ -102,7 +103,7 @@ func TestTotalScore_WeightsSum(t *testing.T) {
 		OccurredAt: now.Add(-1 * time.Hour),
 	}
 
-	factors := s.Score(snap, deploy)
+	factors := s.Score(context.Background(), snap, deploy)
 
 	var total float64
 	for _, f := range factors {
@@ -114,5 +115,34 @@ func TestTotalScore_WeightsSum(t *testing.T) {
 	diff := total - want
 	if diff < -0.0001 || diff > 0.0001 {
 		t.Errorf("factor weights sum = %.4f, want %.4f", total, want)
+	}
+}
+
+func TestTemporalScore_DeployDuringPeriod(t *testing.T) {
+	s := NewScorer(&fakeHistory{})
+	start := time.Date(2026, 7, 8, 0, 0, 0, 0, time.UTC)
+	snap := models.CostSnapshot{
+		Service: "AmazonEC2", PeriodStart: start, PeriodEnd: start.Add(24 * time.Hour),
+	}
+
+	cases := []struct {
+		name string
+		at   time.Time
+		want float64
+	}{
+		{"early in period", start.Add(2 * time.Hour), 1.0},
+		{"mid period", start.Add(12 * time.Hour), 1.0},
+		{"late in period (<25% left)", start.Add(20 * time.Hour), 0.5},
+		{"exactly at period end", start.Add(24 * time.Hour), 0.5},
+		{"after period end", start.Add(24*time.Hour + time.Minute), 0.0},
+		{"before period still decays", start.Add(-3 * time.Hour), 0.85},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := s.temporalScore(snap, models.DeployEvent{OccurredAt: tc.at}).Score
+			if got != tc.want {
+				t.Errorf("temporal=%.2f want %.2f", got, tc.want)
+			}
+		})
 	}
 }

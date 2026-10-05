@@ -72,6 +72,50 @@ func TestSaveCostSnapshots_ThenUnblamedAnomalies(t *testing.T) {
 	}
 }
 
+func TestSaveCostSnapshots_RePollUpsertsSamePeriod(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	periodStart := time.Date(2026, 7, 8, 0, 0, 0, 0, time.UTC)
+	periodEnd := periodStart.Add(24 * time.Hour)
+
+	snap := models.CostSnapshot{
+		ID:          models.SnapshotID("aws", "AmazonEC2", periodStart, periodEnd, models.GranularityDaily),
+		CollectedAt: time.Now().UTC(),
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+		Source:      "aws",
+		Service:     "AmazonEC2",
+		AmountUSD:   100.0,
+		IsAnomaly:   false,
+		Granularity: models.GranularityDaily,
+	}
+	if err := store.SaveCostSnapshots(ctx, []models.CostSnapshot{snap}); err != nil {
+		t.Fatalf("first save: %v", err)
+	}
+
+	// Re-poll of the same period: same natural key ⇒ same ID, updated amounts.
+	repoll := snap
+	repoll.ID = models.SnapshotID("aws", "AmazonEC2", periodStart, periodEnd, models.GranularityDaily)
+	repoll.AmountUSD = 250.0
+	repoll.IsAnomaly = true
+	repoll.AnomalyScore = 3.1
+	if err := store.SaveCostSnapshots(ctx, []models.CostSnapshot{repoll}); err != nil {
+		t.Fatalf("re-poll save: %v", err)
+	}
+
+	anomalies, err := store.UnblamedAnomalies(ctx)
+	if err != nil {
+		t.Fatalf("UnblamedAnomalies: %v", err)
+	}
+	if len(anomalies) != 1 {
+		t.Fatalf("expected exactly 1 row after re-poll, got %d", len(anomalies))
+	}
+	if anomalies[0].AmountUSD != 250.0 {
+		t.Errorf("AmountUSD = %.1f, want 250.0 (re-poll should refresh amounts)", anomalies[0].AmountUSD)
+	}
+}
+
 func TestUpsertDeployEvent_TwoPhase(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -171,6 +215,7 @@ func TestSaveBlameEdges_RoundTrip(t *testing.T) {
 		OccurredAt: time.Now().UTC().Add(-30 * time.Minute),
 		Source:     models.DeploySourceGitHubActions,
 		Repository: "myorg/myrepo",
+		PRAuthor:   "bob",
 		Status:     models.DeployStatusSuccess,
 	}); err != nil {
 		t.Fatalf("seed deploy event: %v", err)
@@ -202,5 +247,11 @@ func TestSaveBlameEdges_RoundTrip(t *testing.T) {
 	}
 	if edges[0].ConfidenceScore != 0.88 {
 		t.Errorf("ConfidenceScore = %.2f, want 0.88", edges[0].ConfidenceScore)
+	}
+	if edges[0].CostSnapshot == nil || edges[0].CostSnapshot.Service != "AWSLambda" {
+		t.Errorf("CostSnapshot not hydrated with service AWSLambda: %+v", edges[0].CostSnapshot)
+	}
+	if edges[0].DeployEvent == nil || edges[0].DeployEvent.PRAuthor != "bob" {
+		t.Errorf("DeployEvent not hydrated with PRAuthor bob: %+v", edges[0].DeployEvent)
 	}
 }

@@ -16,9 +16,9 @@ import (
 
 // Notifier posts blame edges as JSON to an outbound HTTP endpoint.
 type Notifier struct {
-	url       string
-	minScore  float64
-	client    *http.Client
+	url      string
+	minScore float64
+	client   *http.Client
 }
 
 // New creates a Notifier that POSTs to url when confidence ≥ minScore.
@@ -31,15 +31,15 @@ func New(url string, minScore float64) *Notifier {
 }
 
 type payload struct {
-	EdgeID    string  `json:"edge_id"`
-	Service   string  `json:"service"`
-	DeltaPct  float64 `json:"delta_pct"`
-	AmountUSD float64 `json:"amount_usd"`
-	PRNumber  int     `json:"pr_number"`
-	PRAuthor  string  `json:"pr_author"`
-	Score     float64 `json:"confidence_score"`
-	Narrative string  `json:"narrative"`
-	DetectedAt string `json:"detected_at"`
+	EdgeID     string  `json:"edge_id"`
+	Service    string  `json:"service"`
+	DeltaPct   float64 `json:"delta_pct"`
+	AmountUSD  float64 `json:"amount_usd"`
+	PRNumber   int     `json:"pr_number"`
+	PRAuthor   string  `json:"pr_author"`
+	Score      float64 `json:"confidence_score"`
+	Narrative  string  `json:"narrative"`
+	DetectedAt string  `json:"detected_at"`
 }
 
 // Send posts the graph's top blame edge to the configured webhook URL.

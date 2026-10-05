@@ -1,0 +1,48 @@
+{{define "content"}}
+<div id="dashboard-live"
+     hx-get="/" hx-select="#dashboard-live" hx-target="#dashboard-live" hx-swap="outerHTML"
+     hx-trigger="every 15s">
+
+  <div class="page-head">
+    <h1>Dashboard</h1>
+    <p class="page-subtitle">costblame watches your cloud bill for spikes and traces each one back to the deploy that caused it.</p>
+  </div>
+
+  <div class="cards">
+    <div class="card">
+      <div class="value" data-countup="{{.UnblamedCount}}">0</div>
+      <div class="label">Unblamed anomalies</div>
+    </div>
+    <div class="card">
+      <div class="value" data-countup="{{.AwaitingReview}}">0</div>
+      <div class="label">Awaiting review</div>
+    </div>
+    <div class="card">
+      <div class="value" data-countup="{{.ConfirmedCount}}">0</div>
+      <div class="label">Confirmed</div>
+    </div>
+    <div class="card card-live">
+      <div class="live-dot"></div>
+      <div class="label">Live &middot; refreshing every 15s</div>
+    </div>
+  </div>
+
+  <h2>Recent blame edges</h2>
+  {{if not .Recent}}
+    <div class="empty-state">
+      <p>No resolved blame edges yet.</p>
+      <p class="muted">Everything's connected — this fills in as soon as a cost anomaly is detected and matched to a deploy. The correlation engine checks automatically; nothing to trigger by hand.</p>
+    </div>
+  {{else}}
+  <table>
+    <thead>
+      <tr><th>Service</th><th>Delta</th><th>Score</th><th>PR</th><th>Author</th><th>Status</th><th>When</th><th></th></tr>
+    </thead>
+    <tbody>
+      {{range .Recent}}{{template "blame_row.html" .}}{{end}}
+    </tbody>
+  </table>
+  <p><a class="plain" href="/blame">View all blame edges &rarr;</a></p>
+  {{end}}
+</div>
+{{end}}

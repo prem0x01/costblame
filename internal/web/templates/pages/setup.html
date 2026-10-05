@@ -1,0 +1,115 @@
+{{define "content"}}
+<div id="setup-live"
+     hx-get="/setup" hx-select="#setup-live" hx-target="#setup-live" hx-swap="outerHTML"
+     hx-trigger="every 10s">
+
+<div class="page-head">
+  <h1>Set up costblame</h1>
+  <p class="page-subtitle">costblame watches your cloud bill for spikes and traces each one back to the deploy that caused it. Nothing below is clickable configuration — costblame reads settings once at startup, so each step tells you exactly what to edit and where.</p>
+</div>
+
+<div class="progress-track">
+  <div class="progress-track-head">
+    <span>Required setup</span>
+    <span>{{.Status.RequiredStepsDone}} of {{.Status.RequiredStepsTotal}} done</span>
+  </div>
+  <div class="progress-bar"><div class="progress-bar-fill" style="width: {{.Status.ProgressPct}}%"></div></div>
+</div>
+
+{{if .Status.Ready}}
+<div class="wizard-done">
+  <div class="wizard-done-check">&#10003;</div>
+  <div>
+    <h2>You're all set</h2>
+    <p class="muted">A cost source and a deploy source are both connected. costblame is scanning for anomalies now and will attribute them to deploys automatically as they happen — nothing left to do here.</p>
+    <a class="btn btn-primary" href="/">Go to the dashboard</a>
+  </div>
+</div>
+{{end}}
+
+<ol class="wizard">
+
+  <li class="wizard-step {{if .Status.HasCostSource}}done{{end}}">
+    <div class="wizard-marker"><span class="wizard-marker-dot">{{if .Status.HasCostSource}}&#10003;{{else}}1{{end}}</span><span class="wizard-marker-line"></span></div>
+    <div class="wizard-body">
+      <div class="wizard-title-row">
+        <h2>Connect a cost source</h2>
+        <span class="pill {{if .Status.HasCostSource}}pill-done{{else}}pill-pending{{end}}">{{if .Status.HasCostSource}}Connected &middot; {{.Status.CostProvider}}{{else}}Not connected{{end}}</span>
+      </div>
+      <p class="muted">This is where costblame reads your cloud bill from, so it has something to compare against a rolling baseline and flag as a spike. Built-in adapter: AWS Cost Explorer.</p>
+
+      <ol class="instructions">
+        <li>Make sure the machine running <code>costblame</code> can already authenticate to AWS — an instance role, a shared credentials file, or the usual <code>AWS_ACCESS_KEY_ID</code> / <code>AWS_SECRET_ACCESS_KEY</code> env vars. costblame uses the default AWS credential chain; it doesn't take credentials directly.</li>
+        <li>Open <code>costblame.yaml</code> (or create it next to the binary) and add:
+          <pre class="config-snippet"><code>cost:
+  provider: aws
+  aws:
+    region: us-east-1
+    granularity: DAILY</code></pre>
+        </li>
+        <li>Or skip the file entirely and set env vars instead:
+          <pre class="config-snippet"><code>COSTBLAME_COST_PROVIDER=aws
+COSTBLAME_COST_AWS_REGION=us-east-1</code></pre>
+        </li>
+        <li>Restart <code>costblame serve</code>. This step is checked off as soon as the process starts with a provider configured — you don't need working credentials yet to see it turn green, but the poller will log a real error until they're valid.</li>
+      </ol>
+    </div>
+  </li>
+
+  <li class="wizard-step {{if .Status.HasDeploySource}}done{{end}}">
+    <div class="wizard-marker"><span class="wizard-marker-dot">{{if .Status.HasDeploySource}}&#10003;{{else}}2{{end}}</span><span class="wizard-marker-line"></span></div>
+    <div class="wizard-body">
+      <div class="wizard-title-row">
+        <h2>Connect a deploy source</h2>
+        <span class="pill {{if .Status.HasDeploySource}}pill-done{{else}}pill-pending{{end}}">{{if .Status.HasDeploySource}}Connected &middot; {{range $i, $s := .Status.DeploySources}}{{if $i}}, {{end}}{{$s}}{{end}}{{else}}Not connected{{end}}</span>
+      </div>
+      <p class="muted">This is where costblame learns what shipped, so it has something to blame a cost spike on. Pick exactly one to start.</p>
+
+      <ol class="instructions">
+        <li><strong>Option A — GitHub Actions.</strong> In <code>costblame.yaml</code>:
+          <pre class="config-snippet"><code>sources:
+  github:
+    webhook_secret: "&lt;a secret only you and GitHub know&gt;"
+    token: "&lt;optional GitHub token, enables PR/changed-files enrichment&gt;"
+    deploy_workflows: ["Deploy"]   # optional — which workflows count as deploys</code></pre>
+          or the env vars <code>GITHUB_WEBHOOK_SECRET</code> / <code>GITHUB_TOKEN</code>. An empty secret is refused on purpose — costblame won't mount an unsigned receiver.
+        </li>
+        <li><strong>Option B — GitLab CI.</strong>
+          <pre class="config-snippet"><code>sources:
+  gitlab:
+    webhook_secret: "&lt;a secret only you and GitLab know&gt;"</code></pre>
+        </li>
+        <li><strong>Option C — ArgoCD.</strong> Opt-in, and a token is required. Configure ArgoCD's webhook notification to send it as an <code>Authorization: Bearer</code> header:
+          <pre class="config-snippet"><code>sources:
+  argocd:
+    enabled: true
+    token: "&lt;a token only you and ArgoCD know&gt;"</code></pre>
+        </li>
+        <li>In your CI/CD tool's webhook settings, point it at <code>POST /webhooks/&lt;github|gitlab|argocd&gt;</code> on this server's address.</li>
+        <li>Restart <code>costblame serve</code> — this page checks that status again automatically every few seconds.</li>
+      </ol>
+    </div>
+  </li>
+
+  <li class="wizard-step optional {{if .Status.UsingLLM}}done{{end}}">
+    <div class="wizard-marker"><span class="wizard-marker-dot">{{if .Status.UsingLLM}}&#10003;{{else}}&#9679;{{end}}</span></div>
+    <div class="wizard-body">
+      <div class="wizard-title-row">
+        <h2>Narrative engine <span class="muted">(optional)</span></h2>
+        <span class="pill {{if .Status.UsingLLM}}pill-done{{else}}pill-neutral{{end}}">{{.Status.NarrativeEngine}}</span>
+      </div>
+      <p class="muted">Without this, blame narratives are plain-template sentences — still accurate, just not prose. Both steps above work fully without it.</p>
+      <ol class="instructions">
+        <li>In <code>costblame.yaml</code>:
+          <pre class="config-snippet"><code>llm:
+  provider: anthropic   # or openai, ollama
+  api_key: "..."</code></pre>
+        </li>
+      </ol>
+    </div>
+  </li>
+
+</ol>
+
+</div>
+{{end}}
