@@ -115,3 +115,34 @@ func TestLoad_DeployWorkflows(t *testing.T) {
 		}
 	})
 }
+
+func TestLoad_AnomalyDetectionSettings(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		chdir(t, t.TempDir())
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := cfg.Cost
+		if c.ZScoreThreshold != 3.5 || c.MinHistoryDays != 7 || c.SameWeekdayBaseline || c.SigmaFloorUSD != 1.0 {
+			t.Errorf("defaults = z %v, min history %d, same weekday %v, floor %v; want 3.5, 7, false, 1.0",
+				c.ZScoreThreshold, c.MinHistoryDays, c.SameWeekdayBaseline, c.SigmaFloorUSD)
+		}
+	})
+
+	t.Run("from env", func(t *testing.T) {
+		chdir(t, t.TempDir())
+		t.Setenv("COSTBLAME_COST_ZSCORE_THRESHOLD", "5")
+		t.Setenv("COSTBLAME_COST_MIN_HISTORY_DAYS", "14")
+		t.Setenv("COSTBLAME_COST_SAME_WEEKDAY_BASELINE", "true")
+		t.Setenv("COSTBLAME_COST_SIGMA_FLOOR_USD", "2.5")
+		cfg, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := cfg.Cost
+		if c.ZScoreThreshold != 5 || c.MinHistoryDays != 14 || !c.SameWeekdayBaseline || c.SigmaFloorUSD != 2.5 {
+			t.Errorf("env overrides not applied: %+v", c)
+		}
+	})
+}

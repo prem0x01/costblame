@@ -3,6 +3,7 @@ package aws
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -16,21 +17,29 @@ import (
 
 const sourceName = "aws"
 
-// zScoreAnomalyThreshold: flag costs that are more than 2 stddev above baseline.
-const zScoreAnomalyThreshold = 2.0
+// costAPI is the slice of the Cost Explorer client the adapter uses; it lets
+// tests substitute a fake without AWS credentials or network access.
+type costAPI interface {
+	GetCostAndUsage(ctx context.Context, params *costexplorer.GetCostAndUsageInput,
+		optFns ...func(*costexplorer.Options)) (*costexplorer.GetCostAndUsageOutput, error)
+}
 
 // CESource polls AWS Cost Explorer and emits CostSnapshot records.
 // It groups costs by SERVICE and any configured tag keys.
 type CESource struct {
-	client       *costexplorer.Client
+	client       costAPI
 	region       string
 	granularity  cetypes.Granularity
 	lookbackDays int
-	minDeltaPct  float64
+	detector     Detector
 }
 
 // NewCESource constructs a CESource using the default AWS credential chain.
-func NewCESource(ctx context.Context, region string, granularity string, lookbackDays int, minDeltaPct float64) (*CESource, error) {
+// detector's settings are validated here so a bad value fails at startup.
+func NewCESource(ctx context.Context, region string, granularity string, lookbackDays int, detector Detector) (*CESource, error) {
+	if err := detector.validate(lookbackDays); err != nil {
+		return nil, err
+	}
 	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
 	if err != nil {
 		return nil, fmt.Errorf("loading AWS config: %w", err)
@@ -48,7 +57,7 @@ func NewCESource(ctx context.Context, region string, granularity string, lookbac
 		region:       region,
 		granularity:  gran,
 		lookbackDays: lookbackDays,
-		minDeltaPct:  minDeltaPct,
+		detector:     detector,
 	}, nil
 }
 
@@ -87,8 +96,9 @@ func (s *CESource) Collect(ctx context.Context, from, to time.Time) ([]models.Co
 		return nil, fmt.Errorf("fetching baseline costs: %w", baseResult.err)
 	}
 
-	// Build a baseline map: service → list of daily amounts.
-	baselineMap := buildBaselineMap(baseResult.rows)
+	// One observation per service per baseline day; days with no billing row are
+	// zero, so intermittent services are described accurately.
+	history := buildSeries(baseResult.rows, baselineFrom, baselineTo, s.granularity == cetypes.GranularityDaily)
 
 	// Build the previous-period total for delta calculation.
 	prevPeriodFrom := from.Add(-periodLen)
@@ -99,10 +109,13 @@ func (s *CESource) Collect(ctx context.Context, from, to time.Time) ([]models.Co
 	prevMap := buildTotalMap(prevRows)
 
 	var snapshots []models.CostSnapshot
+	learning := 0
 	for _, row := range curResult.rows {
 		prev := prevMap[row.service]
-		base := newBaseline(baselineMap[row.service])
-		anomaly, zScore := base.isAnomaly(row.amount, prev, s.minDeltaPct, zScoreAnomalyThreshold)
+		verdict := s.detector.Assess(history[row.service], row.day, row.amount, prev)
+		if verdict.Learning {
+			learning++
+		}
 
 		var deltaPct float64
 		if prev > 0 {
@@ -123,17 +136,22 @@ func (s *CESource) Collect(ctx context.Context, from, to time.Time) ([]models.Co
 			PrevAmountUSD: prev,
 			DeltaUSD:      row.amount - prev,
 			DeltaPct:      deltaPct,
-			IsAnomaly:     anomaly,
-			AnomalyScore:  zScore,
+			IsAnomaly:     verdict.Anomaly,
+			AnomalyScore:  verdict.Z,
 			Granularity:   gran,
 		})
 	}
 
+	if learning > 0 {
+		slog.Debug("aws: services with too little history to judge, not flagged",
+			"services", learning, "min_history_days", s.detector.MinHistory)
+	}
 	return snapshots, nil
 }
 
 // ceRow is a raw row returned by Cost Explorer before enrichment.
 type ceRow struct {
+	day     time.Time // start of the result's time bucket (UTC)
 	service string
 	tags    map[string]string
 	amount  float64
@@ -167,6 +185,7 @@ func (s *CESource) fetchCosts(ctx context.Context, from, to time.Time) ([]ceRow,
 				amountStr := aws.ToString(group.Metrics["UnblendedCost"].Amount)
 				amount, _ := strconv.ParseFloat(amountStr, 64)
 				rows = append(rows, ceRow{
+					day:     parseBucketStart(result.TimePeriod),
 					service: svc,
 					tags:    map[string]string{},
 					amount:  amount,
@@ -182,12 +201,49 @@ func (s *CESource) fetchCosts(ctx context.Context, from, to time.Time) ([]ceRow,
 	return rows, nil
 }
 
-func buildBaselineMap(rows []ceRow) map[string][]float64 {
-	m := map[string][]float64{}
-	for _, r := range rows {
-		m[r.service] = append(m[r.service], r.amount)
+// parseBucketStart reads the start of a Cost Explorer time bucket: a plain date
+// for DAILY results, a full timestamp for HOURLY ones. Unparseable input yields
+// the zero time rather than an error, since the day only refines the baseline.
+func parseBucketStart(p *cetypes.DateInterval) time.Time {
+	if p == nil {
+		return time.Time{}
 	}
-	return m
+	start := aws.ToString(p.Start)
+	for _, layout := range []string{"2006-01-02", time.RFC3339, "2006-01-02T15:04:05Z"} {
+		if t, err := time.Parse(layout, start); err == nil {
+			return t.UTC()
+		}
+	}
+	return time.Time{}
+}
+
+// buildSeries groups rows by service into a per-day history over [from, to).
+// With daily set, every day in the window gets an observation and a missing
+// day counts as zero spend; otherwise rows are used as returned.
+func buildSeries(rows []ceRow, from, to time.Time, daily bool) map[string][]observation {
+	out := map[string][]observation{}
+	if !daily {
+		for _, r := range rows {
+			out[r.service] = append(out[r.service], observation{Day: r.day, Amount: r.amount})
+		}
+		return out
+	}
+
+	start := from.UTC().Truncate(24 * time.Hour)
+	end := to.UTC().Truncate(24 * time.Hour)
+	spend := map[string]map[time.Time]float64{}
+	for _, r := range rows {
+		if spend[r.service] == nil {
+			spend[r.service] = map[time.Time]float64{}
+		}
+		spend[r.service][r.day.UTC().Truncate(24*time.Hour)] += r.amount
+	}
+	for svc, byDay := range spend {
+		for d := start; d.Before(end); d = d.AddDate(0, 0, 1) {
+			out[svc] = append(out[svc], observation{Day: d, Amount: byDay[d]})
+		}
+	}
+	return out
 }
 
 func buildTotalMap(rows []ceRow) map[string]float64 {

@@ -77,7 +77,7 @@ func DeployEventID(source DeploySource, parts ...string) uuid.UUID {
 
 // CostSnapshot is a point-in-time cost reading for one service/tag combination.
 // It captures both the raw amount and its delta vs. the previous equivalent period,
-// along with an anomaly score expressed as standard deviations from the rolling baseline.
+// along with an anomaly score: a robust z-score, i.e. MAD-scaled deviations above the rolling median.
 type CostSnapshot struct {
 	ID            uuid.UUID         `db:"id"             json:"id"`
 	CollectedAt   time.Time         `db:"collected_at"   json:"collected_at"`
@@ -92,7 +92,7 @@ type CostSnapshot struct {
 	DeltaUSD      float64           `db:"delta_usd"      json:"delta_usd"`
 	DeltaPct      float64           `db:"delta_pct"      json:"delta_pct"`
 	IsAnomaly     bool              `db:"is_anomaly"     json:"is_anomaly"`
-	AnomalyScore  float64           `db:"anomaly_score"  json:"anomaly_score"` // stddev from 30d baseline
+	AnomalyScore  float64           `db:"anomaly_score"  json:"anomaly_score"` // robust z-score vs 30d median
 	Granularity   Granularity       `db:"granularity"    json:"granularity"`
 }
 

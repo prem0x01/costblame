@@ -73,7 +73,7 @@ That investigation tax is paid on *every single spike*. `costblame` pays it once
 
 Six steps, fully automatic:
 
-1. **Polls your cloud billing API** on a configurable interval. For each service, it computes a rolling 30-day baseline and flags anything more than 2 standard deviations above it as an anomaly.
+1. **Polls your cloud billing API** on a configurable interval. For each service, it computes a rolling 30-day baseline (median and MAD, so past spikes don't hide new ones) and flags spend that is a robust z-score above 3.5 over it as an anomaly.
 2. **Ingests deploy events** from your CI/CD via webhooks, enriching each one asynchronously with PR metadata and changed file paths.
 3. **Scores every deployment** from the 72 hours before the anomalous cost period through the end of that period on four independent, explainable factors. The weighted sum is the confidence score — no black box.
 4. **Generates a narrative** — a 2–3 sentence plain-English explanation of what spiked, what probably caused it, and what to do next. Uses your LLM if you configure one, clean templates if you don't. **An LLM is never required.**
@@ -134,7 +134,7 @@ The whole system is one process. Data flows top to bottom: the outside world fee
 ║  │                         │  │                              │      │        ║
 ║  │ · rolling 30-day        │  │ · POST /webhooks/<source>    │      │        ║
 ║  │   baseline per service  │  │ · signature check, then      │      │        ║
-║  │ · z-score > 2σ  AND     │  │   202 Accepted in ~1 ms      │      │        ║
+║  │ · robust z > 3.5 AND    │  │   202 Accepted in ~1 ms      │      │        ║
 ║  │   Δ ≥ 20%  ⇒  anomaly   │  │ · PR + changed files         │      │        ║
 ║  │                         │  │   enriched in background     │      │        ║
 ║  └────────────┬────────────┘  └───────────────┬──────────────┘      │        ║
@@ -179,7 +179,7 @@ The whole system is one process. Data flows top to bottom: the outside world fee
 
 ### ❶ The cost collector — *pull*
 
-A `collect.CostSource` adapter polls your billing API on `cost.poll_interval` (default 15m). For every service it sees, it maintains a rolling 30-day baseline (mean and standard deviation of daily spend). A reading is flagged as an anomaly only when **both** conditions hold: the z-score exceeds 2.0 *and* the relative increase beats `anomaly_min_delta_pct` (default 20%). The double condition matters — the z-score catches statistically unusual jumps, while the minimum delta filters out "statistically unusual but who cares" noise on near-zero services. Anomalies land in the store as `CostSnapshot` rows with `is_anomaly = true`.
+A `collect.CostSource` adapter polls your billing API on `cost.poll_interval` (default 15m). For every service it sees, it maintains a rolling 30-day baseline of daily spend (days with no billing count as zero). The baseline uses the **median and the median absolute deviation (MAD)** rather than the mean and standard deviation: a past spike does not inflate it and hide the next one, and a perfectly flat history still has a usable spread (a floor derived from `anomaly_min_delta_pct` and `zscore_threshold`, so a flat series is flagged as soon as it rises by the minimum delta, and at least `sigma_floor_usd`), so $5/day jumping to $500 is caught, and so is a steady $1,000/day service rising 25%. A reading is flagged as an anomaly only when **both** conditions hold: the robust z-score exceeds `zscore_threshold` (default 3.5, the conventional cut-off for MAD scores) *and* the relative increase beats `anomaly_min_delta_pct` (default 20%). The double condition matters — the z-score catches statistically unusual jumps, while the minimum delta filters out "statistically unusual but who cares" noise on near-zero services. Services with fewer than `min_history_days` days of spend (default 7) are still *learning* and are never flagged; services that bill on fewer than half of the days are compared against their own billed days, so a normal run is not a spike. Set `same_weekday_baseline: true` to compare each day only with the same weekday, which suppresses weekly patterns such as a Saturday batch job. Anomalies land in the store as `CostSnapshot` rows with `is_anomaly = true`.
 
 ### ❷ The deploy receivers — *push*
 
@@ -273,7 +273,7 @@ A real run, end to end. (This example uses the default adapter stack — swap an
          │
          ▼
 4. costblame's next poll catches it
-   → z-score = 3.8 (> 2.0 threshold)
+   → robust z-score = 3.8 (> 3.5 threshold)
    → CostSnapshot saved with is_anomaly = true
          │
          ▼
@@ -384,7 +384,11 @@ Everything lives in `costblame.yaml` **or** environment variables — env wins, 
 cost:
   provider: aws                 # billing adapter — implement collect.CostSource to add more
   poll_interval: 15m
-  lookback_days: 30             # baseline window for z-score
+  lookback_days: 30             # baseline window (days)
+  zscore_threshold: 3.5         # robust (median/MAD) z-score that counts as a spike
+  min_history_days: 7           # days with spend needed before a service can be flagged
+  same_weekday_baseline: false  # compare with the same weekday only
+  sigma_floor_usd: 1.0          # smallest spread used; stops pennies on tiny services flagging
   anomaly_min_delta_pct: 20.0   # ignore spikes smaller than this
   aws:                          # settings for the selected provider
     region: us-east-1
@@ -620,7 +624,7 @@ No and no. MIT-licensed, self-hosted, yours.
 ## Components
 
 - **`internal/collect`** — the `CostSource` and `DeploySource` interfaces the engine depends on. Cloud- and CI-agnostic.
-- **`internal/collect/aws`** — billing adapter for AWS Cost Explorer: polls cost data, computes the rolling baseline, flags z-score anomalies.
+- **`internal/collect/aws`** — billing adapter for AWS Cost Explorer: polls cost data, computes the rolling median/MAD baseline, flags robust z-score anomalies.
 - **`internal/collect/github`** — deploy adapter for GitHub Actions: validates HMAC-SHA256 webhook signatures, acks immediately (HTTP 202), enriches PR metadata asynchronously.
 - **`internal/collect/gitlab` / `internal/collect/argocd`** — deploy adapters for GitLab CI pipeline events and ArgoCD sync events, following the same two-phase pattern.
 - **`internal/correlate/engine`** — the main loop: finds unblamed anomalies, scores deploy candidates, persists edges, triggers narratives and alerts.

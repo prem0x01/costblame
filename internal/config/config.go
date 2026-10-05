@@ -68,7 +68,19 @@ type CostConfig struct {
 	PollInterval    time.Duration `mapstructure:"poll_interval"`
 	LookbackDays    int           `mapstructure:"lookback_days"`         // baseline window for z-score
 	AnomalyMinDelta float64       `mapstructure:"anomaly_min_delta_pct"` // minimum % increase to flag
-	AWS             AWSCostConfig `mapstructure:"aws"`
+	// ZScoreThreshold is the robust (median/MAD) z-score above which spend is
+	// anomalous. 3.5 is the conventional cut-off for MAD-based scores.
+	ZScoreThreshold float64 `mapstructure:"zscore_threshold"`
+	// MinHistoryDays is how many days with spend a service needs before it can
+	// be flagged; with less it is still "learning". 0 disables the check.
+	MinHistoryDays int `mapstructure:"min_history_days"`
+	// SameWeekdayBaseline compares a day with the same weekday only, so weekly
+	// patterns (a Saturday batch job) are not flagged.
+	SameWeekdayBaseline bool `mapstructure:"same_weekday_baseline"`
+	// SigmaFloorUSD is the smallest spread ever used when scoring, so tiny
+	// services do not flag on pennies.
+	SigmaFloorUSD float64       `mapstructure:"sigma_floor_usd"`
+	AWS           AWSCostConfig `mapstructure:"aws"`
 }
 
 // AWSCostConfig holds settings specific to the AWS Cost Explorer adapter.
@@ -187,6 +199,10 @@ func Load(cfgFile string) (*Config, error) {
 	v.SetDefault("cost.poll_interval", "15m")
 	v.SetDefault("cost.lookback_days", 30)
 	v.SetDefault("cost.anomaly_min_delta_pct", 20.0)
+	v.SetDefault("cost.zscore_threshold", 3.5)
+	v.SetDefault("cost.min_history_days", 7)
+	v.SetDefault("cost.same_weekday_baseline", false)
+	v.SetDefault("cost.sigma_floor_usd", 1.0)
 	v.SetDefault("cost.aws.region", "us-east-1")
 	v.SetDefault("cost.aws.granularity", "DAILY")
 	v.SetDefault("sources.github.webhook_secret", "")

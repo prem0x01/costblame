@@ -432,8 +432,14 @@ func buildCostSource(ctx context.Context, cfg config.CostConfig) (collect.CostSo
 	switch cfg.Provider {
 	case "", "aws":
 		src, err := aws.NewCESource(ctx,
-			cfg.AWS.Region, cfg.AWS.Granularity,
-			cfg.LookbackDays, cfg.AnomalyMinDelta,
+			cfg.AWS.Region, cfg.AWS.Granularity, cfg.LookbackDays,
+			aws.Detector{
+				ZThreshold:    cfg.ZScoreThreshold,
+				MinDeltaPct:   cfg.AnomalyMinDelta,
+				MinHistory:    cfg.MinHistoryDays,
+				SameWeekday:   cfg.SameWeekdayBaseline,
+				SigmaFloorUSD: cfg.SigmaFloorUSD,
+			},
 		)
 		if err != nil {
 			return nil, fmt.Errorf("aws cost source: %w", err)

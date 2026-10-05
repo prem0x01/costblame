@@ -35,8 +35,14 @@ database:
 cost:
   provider: aws           # built-in: aws — implement collect.CostSource to add more
   poll_interval: 15m
-  lookback_days: 30       # baseline window for z-score anomaly detection
+  lookback_days: 30       # baseline window (days) for anomaly detection
   anomaly_min_delta_pct: 20.0   # ignore spikes smaller than this
+  # Detection uses the median and MAD of the baseline, not mean and stddev, so past
+  # spikes don't hide new ones and flat spend ($5/day, then $500) is still caught.
+  zscore_threshold: 3.5         # robust z-score above which spend is anomalous
+  min_history_days: 7           # days with spend needed before a service can be flagged (0 = off)
+  same_weekday_baseline: false  # compare with the same weekday only (weekly batch jobs)
+  sigma_floor_usd: 1.0          # smallest spread used, so pennies on tiny services don't flag
 
   # Settings for the AWS Cost Explorer adapter (only read when provider: aws).
   aws:
