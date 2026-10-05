@@ -339,7 +339,7 @@ func newServiceMap(cfg config.CorrelationConfig) (*correlate.ServiceMap, error) 
 
 // serviceSignalWarnings explains, for each enabled deploy source, when its
 // deploys cannot possibly match a spiking service. Without a service match the
-// best score is 0.60, under the 0.65 alert threshold, so such a source would
+// best score is 0.625, under the 0.65 alert threshold, so such a source would
 // store candidates but never alert; better to say so at startup than to look
 // broken later.
 func serviceSignalWarnings(cfg config.SourcesConfig, sm *correlate.ServiceMap, enabled map[string]webhookSource) []string {

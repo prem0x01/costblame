@@ -26,7 +26,7 @@ One self-hosted Go binary. It watches your cloud spend, listens to your CI/CD pi
  you            : "why is the bill up 145%?"
  costblame      : "PR #847 by @alice — provisioned concurrency on the
                    payment function, deployed 6h before the spike.
-                   Confidence 0.79. Here's the revert suggestion."
+                   Confidence 0.86. Here's the revert suggestion."
  time elapsed   : 4 seconds
  dashboards open: 0
 ```
@@ -61,7 +61,7 @@ Cloud bills spike. Everyone has seen it: serverless invocations explode overnigh
 |---|---|---|
 | **Detection** | Someone notices the bill — days later | Anomaly flagged on the next poll, minutes after billing data lands |
 | **Investigation** | 30–90 min of cross-referencing deploy logs, Git history, billing dashboards | Automatic — scored candidates ranked by evidence |
-| **The answer** | "Probably something we shipped last week?" | *"PR #847 by @alice, 6h before the spike, confidence 0.79"* |
+| **The answer** | "Probably something we shipped last week?" | *"PR #847 by @alice, 6h before the spike, confidence 0.86"* |
 | **The follow-up** | A meeting | A Slack message with a suggested fix, and a one-click confirm/dismiss |
 | **Next time** | Start from scratch | Confirmed blames sharpen future scoring |
 
@@ -229,8 +229,10 @@ Every `(anomaly, deployment)` pair is scored by four independent factors. The we
 |--------|--------|---------------------|
 | `temporal_proximity` | **40%** | A deploy *during* the cost period scores 1.0 (0.5 if it landed in the last quarter of the period and had little time to accrue cost). For earlier deploys, a decay curve measured back from the period start: 1.0 within 2h, 0.85 within 6h, 0.60 within 24h, 0.30 within 48h, 0.10 within 72h, 0.0 beyond. Deploys after the period ended score 0 |
 | `service_match` | **30%** | 1.0 if the deploy's inferred cloud services (from changed file paths) exactly match the anomalous service; 0.7 for a partial match; 0.0 for no match |
-| `tag_match` | **20%** | Compares cost allocation tags (`team`, `env`) on the anomaly against the deployment's repository and environment metadata |
+| `tag_match` | **20%** | Compares cost allocation tags (`team`, `env`) on the anomaly against the deployment's repository and environment metadata. **Skipped when the anomaly has no such tags** |
 | `historical_pattern` | **10%** | Boosts the score if the same author has caused *confirmed* cost spikes on the same service before (capped at 4 prior incidents) |
+
+**When a factor can't be evaluated it is skipped, not guessed.** Cost Explorer results carry no allocation tags yet, so by default `tag_match` is skipped and the other three weights are rescaled to sum to 100% (temporal 50%, service 37.5%, history 12.5%). Each blame edge shows the effective weights, so the numbers always add up to the score. An earlier version scored the missing tags as a neutral 0.5, which quietly added a fixed 0.10 to every score and capped the maximum at 0.90. Without a service match the best possible score is 0.625, so alerts still require evidence that the deploy touches the spiking service.
 
 **Thresholds:**
 
@@ -258,7 +260,7 @@ The default patterns:
 
 ### What each source can tell the scorer
 
-The service match is worth 30% of a score, and **a deploy with no service match cannot reach the 0.65 alert threshold** (its best score is 0.60). So what a source can learn about a deploy decides whether it can ever alert:
+The service match is worth 30% of a score, and **a deploy with no service match cannot reach the 0.65 alert threshold** (its best possible score is 0.625). So what a source can learn about a deploy decides whether it can ever alert:
 
 | Source | PR / author | Changed files → services | Without extra setup |
 |---|---|---|---|
@@ -323,15 +325,15 @@ A real run, end to end. (This example uses the default adapter stack — swap an
          │
          ▼
 6. The scorer shows its work:
-   temporal_proximity : 0.85  (6h window)   × 0.40 = 0.34
-   service_match      : 1.00  (exact match) × 0.30 = 0.30
-   tag_match          : 0.50  (neutral)     × 0.20 = 0.10
-   historical_pattern : 0.50  (2 prior)     × 0.10 = 0.05
+   temporal_proximity : 0.85  (6h window)   × 0.500 = 0.425
+   service_match      : 1.00  (exact match) × 0.375 = 0.375
+   tag_match          : skipped (the anomaly has no tags; weights rescaled)
+   historical_pattern : 0.50  (2 prior)     × 0.125 = 0.063
                                               ─────────
-                                    TOTAL:      0.79  ✓
+                                    TOTAL:      0.86  ✓
          │
          ▼
-7. Score 0.79 ≥ 0.65 → high confidence
+7. Score 0.86 ≥ 0.65 → high confidence
    → narrative generated:
      "Cost for serverless compute increased 145% (USD 155 → USD 380)
       on Jun 10. PR #847 (feat: enable provisioned concurrency) by
@@ -610,7 +612,7 @@ Slack uses a bot token + channel ID. For every other tool — incident managemen
   "amount_usd": 380.0,
   "pr_number": 847,
   "pr_author": "alice",
-  "confidence_score": 0.79,
+  "confidence_score": 0.86,
   "narrative": "…",
   "detected_at": "2026-06-10T14:32:00Z"
 }

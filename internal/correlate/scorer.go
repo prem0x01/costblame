@@ -38,13 +38,35 @@ func NewScorer(h HistoryReader) *Scorer {
 }
 
 // Score returns the individual ConfidenceFactors for a (anomaly, deploy) pair.
+//
+// A factor that cannot be evaluated (the tag factor when the anomaly carries no
+// usable allocation tags) is skipped: its weight is 0 and the remaining weights
+// are rescaled to sum to 1. Each factor's Weight is therefore its actual share
+// of the total, the total can span the full 0..1 range, and "unknown" no longer
+// adds a fixed 0.10 to every score the way a neutral 0.5 did.
 func (s *Scorer) Score(ctx context.Context, anomaly models.CostSnapshot, deploy models.DeployEvent) []models.ConfidenceFactor {
-	return []models.ConfidenceFactor{
+	return normalizeWeights([]models.ConfidenceFactor{
 		s.temporalScore(anomaly, deploy),
 		s.serviceScore(anomaly, deploy),
 		s.tagScore(anomaly, deploy),
 		s.historicalScore(ctx, anomaly, deploy),
+	})
+}
+
+// normalizeWeights rescales factor weights so they sum to 1. When every factor
+// is applied they already do and nothing changes.
+func normalizeWeights(factors []models.ConfidenceFactor) []models.ConfidenceFactor {
+	var sum float64
+	for _, f := range factors {
+		sum += f.Weight
 	}
+	if sum <= 0 || math.Abs(sum-1) < 1e-9 {
+		return factors
+	}
+	for i := range factors {
+		factors[i].Weight /= sum
+	}
+	return factors
 }
 
 // TotalScore sums all factor contributions into a single [0, 1] confidence score.
@@ -166,13 +188,15 @@ func (s *Scorer) serviceScore(anomaly models.CostSnapshot, deploy models.DeployE
 }
 
 // tagScore compares the anomaly's resource tags against the deploy's team/env metadata.
-// When the anomaly has no tags, the factor returns a neutral 0.5 — unknown, not negative.
+// When the anomaly has no tags to compare, the factor is skipped (weight 0): unknown
+// is not evidence for or against, and Score rescales the other weights.
 func (s *Scorer) tagScore(anomaly models.CostSnapshot, deploy models.DeployEvent) models.ConfidenceFactor {
+	skipped := models.ConfidenceFactor{
+		Name: "tag_match", Score: 0, Weight: 0,
+		Reason: "no team/env allocation tags on the anomaly — factor not applied, other weights rescaled",
+	}
 	if len(anomaly.Tags) == 0 {
-		return models.ConfidenceFactor{
-			Name: "tag_match", Score: 0.5, Weight: weightTag,
-			Reason: "no tags on anomaly — neutral score applied",
-		}
+		return skipped
 	}
 
 	matches, checks := 0, 0
@@ -191,10 +215,10 @@ func (s *Scorer) tagScore(anomaly models.CostSnapshot, deploy models.DeployEvent
 		}
 	}
 
-	var score float64
-	if checks > 0 {
-		score = float64(matches) / float64(checks)
+	if checks == 0 {
+		return skipped // tags exist but none of them is a team or env tag
 	}
+	score := float64(matches) / float64(checks)
 
 	return models.ConfidenceFactor{
 		Name:   "tag_match",

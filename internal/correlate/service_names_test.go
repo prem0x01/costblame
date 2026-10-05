@@ -90,7 +90,7 @@ func TestServiceMatch_LongerNamesDoNotBorrowAShorterServicesCredit(t *testing.T)
 		ce, inferred string
 		want         float64
 	}{
-		{"Amazon EC2 Container Registry (ECR)", "AmazonEC2", 0}, // would have been a 0.7 partial: score 0.71, a false alert
+		{"Amazon EC2 Container Registry (ECR)", "AmazonEC2", 0}, // would have been a 0.7 partial: score 0.76, a false alert
 		{"Amazon EC2 Container Registry (ECR)", "ecr", 1.0},
 		{"Amazon Elastic Container Registry", "ecr", 1.0},
 		{"Amazon EC2 Container Service", "AmazonECS", 1.0}, // the old name of ECS

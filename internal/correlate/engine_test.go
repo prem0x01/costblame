@@ -26,10 +26,17 @@ type hookStore struct {
 	failMarkScored int // number of upcoming MarkAnomalyScored calls to fail
 	saves          int
 	historyQueries int // ConfirmedBlameCount round trips
+
+	// confirmedByAuthor, when set, replaces the stored confirmed-blame history
+	// so tests can give an author a track record without confirming real edges.
+	confirmedByAuthor map[string]int
 }
 
 func (h *hookStore) ConfirmedBlameCount(ctx context.Context, author, service string) (int, error) {
 	h.historyQueries++
+	if h.confirmedByAuthor != nil {
+		return h.confirmedByAuthor[author], nil
+	}
 	return h.Store.ConfirmedBlameCount(ctx, author, service)
 }
 
@@ -190,7 +197,7 @@ func TestCorrelateNew_HighConfidence_SavesResolvesAndNotifies(t *testing.T) {
 	env := newEnv(t, 0.2)
 	anomaly := anomalyAt(spike)
 	env.seedAnomaly(anomaly)
-	// 1h before the period + exact service match ⇒ 0.4 + 0.3 + 0.1 (neutral tags) = 0.80
+	// 1h before the period + exact service match ⇒ 0.5 + 0.375 = 0.875 (no tags: that factor is skipped)
 	d := deployAt(spike.Add(-time.Hour), "AWSLambda")
 	env.seedDeploy(d)
 
@@ -286,7 +293,7 @@ func TestCorrelateNew_DeployDuringPeriod_IsBlamed(t *testing.T) {
 	env := newEnv(t, 0.2)
 	anomaly := anomalyAt(spike)
 	env.seedAnomaly(anomaly)
-	// 10h into a 24h period + exact service match ⇒ 0.4 + 0.3 + 0.1 = 0.80
+	// 10h into a 24h period + exact service match ⇒ 0.5 + 0.375 = 0.875
 	env.seedDeploy(deployAt(spike.Add(10*time.Hour), "AWSLambda"))
 
 	env.cycle()
@@ -414,7 +421,7 @@ func TestEnrichmentAfterScoring_PromotesAndAlerts(t *testing.T) {
 	env := newEnv(t, 0.2)
 	anomaly := anomalyAt(spike)
 	env.seedAnomaly(anomaly)
-	d := deployAt(spike.Add(-time.Hour)) // no inferred services yet ⇒ 0.4 + 0.1 = 0.50
+	d := deployAt(spike.Add(-time.Hour)) // no inferred services yet ⇒ temporal only: 0.50
 	env.seedDeploy(d)
 
 	env.cycle()
@@ -423,7 +430,7 @@ func TestEnrichmentAfterScoring_PromotesAndAlerts(t *testing.T) {
 		t.Fatalf("setup: expected one pending edge and no alert, got %d edges, %d alerts", len(edges), len(env.notifier.sent))
 	}
 
-	d.InferredServices = []string{"AWSLambda"} // enrichment arrives: ⇒ 0.80
+	d.InferredServices = []string{"AWSLambda"} // enrichment arrives: ⇒ 0.875
 	env.seedDeploy(d)
 	env.cycle()
 
@@ -445,14 +452,14 @@ func TestOneAlertPerAnomaly(t *testing.T) {
 	env := newEnv(t, 0.2)
 	anomaly := anomalyAt(spike)
 	env.seedAnomaly(anomaly)
-	first := deployAt(spike.Add(-5*time.Hour), "AWSLambda") // 0.85*0.4 + 0.3 + 0.1 = 0.74
+	first := deployAt(spike.Add(-5*time.Hour), "AWSLambda") // 0.85*0.5 + 0.375 = 0.80
 	env.seedDeploy(first)
 	env.cycle()
 	if len(env.notifier.sent) != 1 {
 		t.Fatalf("setup: first alert missing")
 	}
 
-	env.seedDeploy(deployAt(spike.Add(-time.Hour), "AWSLambda")) // 0.80, stronger
+	env.seedDeploy(deployAt(spike.Add(-time.Hour), "AWSLambda")) // 0.875, stronger
 	env.cycle()
 
 	edges := env.edges(anomaly)
@@ -626,8 +633,8 @@ func TestHistoryCountsAreCachedWithinACycle(t *testing.T) {
 }
 
 // An ArgoCD deploy has no author, PR or files. A service-map rule is its only
-// evidence, and it must be enough to reach the alert tier (0.40 temporal +
-// 0.30 service + 0.10 neutral tags = 0.80).
+// evidence, and it must be enough to reach the alert tier (0.50 temporal +
+// 0.375 service, tags skipped = 0.875).
 func TestMappedArgoCDDeployCanReachTheAlertThreshold(t *testing.T) {
 	env := newEnv(t, 0.2)
 	anomaly := anomalyAt(spike)
@@ -656,7 +663,7 @@ func TestMappedArgoCDDeployCanReachTheAlertThreshold(t *testing.T) {
 	}
 }
 
-// Without a service match the same ArgoCD deploy tops out at 0.60 and never alerts.
+// Without a service match the same ArgoCD deploy cannot reach the threshold (temporal alone is 0.50).
 func TestUnmappedArgoCDDeployCannotAlert(t *testing.T) {
 	env := newEnv(t, 0.2)
 	anomaly := anomalyAt(spike)
@@ -674,5 +681,98 @@ func TestUnmappedArgoCDDeployCannotAlert(t *testing.T) {
 	}
 	if edges := env.edges(anomaly); len(edges) != 1 || edges[0].ConfidenceScore >= HighConfidenceThreshold {
 		t.Errorf("expected one stored candidate below the threshold, got %+v", edges)
+	}
+}
+
+// Timing, tags and author history can add up to the threshold on their own
+// (0.40 + 0.20 + 0.10 = 0.70), but with no service match nothing links the
+// deploy to the service that spiked. That must never become an alert.
+func TestNoServiceMatch_NeverAlerts_EvenWithMatchingTagsAndMaximalHistory(t *testing.T) {
+	env := newEnv(t, 0.2)
+	env.store.confirmedByAuthor = map[string]int{"alice": 10} // history at its cap
+	anomaly := anomalyAt(spike)
+	anomaly.Service = "Amazon Simple Storage Service"
+	anomaly.Tags = map[string]string{"team": "payments", "env": "prod"}
+	env.seedAnomaly(anomaly)
+	d := deployAt(spike.Add(-time.Hour), "AWSLambda") // touches Lambda, not S3
+	d.Repository = "acme/payments-api"                // the right team
+	d.Environment = "prod"                            // the right environment
+	env.seedDeploy(d)
+
+	env.cycle()
+
+	edges := env.edges(anomaly)
+	if len(edges) != 1 {
+		t.Fatalf("edges = %d, want the candidate stored", len(edges))
+	}
+	if edges[0].ConfidenceScore < HighConfidenceThreshold {
+		t.Fatalf("setup: score %.2f should be at or above the threshold for this test to mean anything", edges[0].ConfidenceScore)
+	}
+	if edges[0].Status != models.BlameStatusPending || len(env.notifier.sent) != 0 {
+		t.Errorf("a deploy with no service match alerted: status=%q alerts=%d", edges[0].Status, len(env.notifier.sent))
+	}
+}
+
+// If the top-scoring candidate has no service match, the best candidate that
+// does is the one to alert about.
+func TestBestAlertableCandidateIsPromotedWhenTheTopHasNoServiceMatch(t *testing.T) {
+	env := newEnv(t, 0.2)
+	env.store.confirmedByAuthor = map[string]int{"alice": 10, "bob": 3}
+	anomaly := anomalyAt(spike)
+	anomaly.Service = "Amazon Kinesis Firehose"
+	anomaly.Tags = map[string]string{"team": "payments", "env": "prod"}
+	env.seedAnomaly(anomaly)
+
+	// No service match, but the right team and environment and a long record:
+	// 0.40 + 0.20 + 0.10 = 0.70.
+	top := deployAt(spike.Add(-time.Hour), "AmazonS3")
+	top.PRAuthor, top.Repository, top.Environment = "alice", "acme/payments-api", "prod"
+	// A partial service match in the wrong environment: 0.40 + 0.21 + 0 + 0.075 = 0.685.
+	second := deployAt(spike.Add(-time.Hour), "Kinesis")
+	second.PRAuthor, second.Repository, second.Environment = "bob", "acme/other-api", "staging"
+	env.seedDeploy(top)
+	env.seedDeploy(second)
+
+	env.cycle()
+
+	byAuthor := map[string]models.BlameEdge{}
+	for _, e := range env.edges(anomaly) {
+		byAuthor[e.DeployEvent.PRAuthor] = e
+	}
+	if byAuthor["alice"].ConfidenceScore <= byAuthor["bob"].ConfidenceScore {
+		t.Fatalf("setup: the no-service candidate should score highest (alice %.3f, bob %.3f)",
+			byAuthor["alice"].ConfidenceScore, byAuthor["bob"].ConfidenceScore)
+	}
+	if byAuthor["alice"].Status != models.BlameStatusPending {
+		t.Errorf("the top candidate has no service match and must stay pending, got %q", byAuthor["alice"].Status)
+	}
+	if byAuthor["bob"].Status != models.BlameStatusResolved {
+		t.Errorf("the best candidate with a service match should be promoted, got %q (score %.3f)",
+			byAuthor["bob"].Status, byAuthor["bob"].ConfidenceScore)
+	}
+	if len(env.notifier.sent) != 1 || env.notifier.sent[0].TopBlame.DeployEvent.PRAuthor != "bob" {
+		t.Errorf("expected exactly one alert, about bob's deploy; got %d", len(env.notifier.sent))
+	}
+}
+
+func TestAlertable(t *testing.T) {
+	edge := func(score, service float64) models.BlameEdge {
+		return models.BlameEdge{ConfidenceScore: score, ConfidenceFactors: []models.ConfidenceFactor{
+			{Name: "temporal_proximity", Score: 1}, {Name: "service_match", Score: service}}}
+	}
+	for name, tc := range map[string]struct {
+		e    models.BlameEdge
+		want bool
+	}{
+		"confident with a service match":    {edge(0.80, 1.0), true},
+		"confident with a partial match":    {edge(0.70, 0.7), true},
+		"exactly at the threshold":          {edge(HighConfidenceThreshold, 1.0), true},
+		"confident but no service match":    {edge(0.90, 0), false},
+		"service match but under threshold": {edge(0.64, 1.0), false},
+		"no service_match factor at all":    {models.BlameEdge{ConfidenceScore: 0.9}, false},
+	} {
+		if got := alertable(tc.e); got != tc.want {
+			t.Errorf("%s: alertable = %v, want %v", name, got, tc.want)
+		}
 	}
 }

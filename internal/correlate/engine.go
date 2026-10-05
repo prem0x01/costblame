@@ -267,19 +267,26 @@ func (e *Engine) processAnomaly(ctx context.Context, anomaly models.CostSnapshot
 		return edges[i].ConfidenceScore > edges[j].ConfidenceScore
 	})
 
-	// Promote the top edge if it is confident enough, nobody has been alerted
-	// about this anomaly yet, and a human has not already ruled on this very
-	// edge. The narrative is generated before the save so the edge is written
-	// once, in its final state.
-	top := &edges[0]
-	if top.ConfidenceScore >= HighConfidenceThreshold && !alerted {
-		if ex, seen := byDeploy[top.DeployEventID]; !seen || ex.Status == models.BlameStatusPending {
-			if narrative, err := e.narrative.Generate(ctx, *top); err != nil {
-				slog.Warn("narrative generation failed", "edge_id", top.ID, "err", err)
-			} else {
-				top.Narrative = narrative
+	// Promote the best alertable edge (confident enough AND with evidence that
+	// the deploy touches the spiking service) if nobody has been alerted about
+	// this anomaly yet and a human has not already ruled on that very edge. The
+	// narrative is generated before the save so the edge is written once, in its
+	// final state.
+	if !alerted {
+		for i := range edges {
+			if !alertable(edges[i]) {
+				continue
 			}
-			top.Status = models.BlameStatusResolved
+			cand := &edges[i]
+			if ex, seen := byDeploy[cand.DeployEventID]; !seen || ex.Status == models.BlameStatusPending {
+				if narrative, err := e.narrative.Generate(ctx, *cand); err != nil {
+					slog.Warn("narrative generation failed", "edge_id", cand.ID, "err", err)
+				} else {
+					cand.Narrative = narrative
+				}
+				cand.Status = models.BlameStatusResolved
+			}
+			break // one alert per anomaly: the best candidate, whatever its state
 		}
 	}
 
@@ -310,6 +317,24 @@ func (e *Engine) processAnomaly(ctx context.Context, anomaly models.CostSnapshot
 		"top_score", fmt.Sprintf("%.2f", edges[0].ConfidenceScore),
 	)
 	return nil
+}
+
+// alertable reports whether an edge may become an alert. Score alone is not
+// enough: the edge must also show evidence that the deploy touches the spiking
+// service (a non-zero service_match). Tags, timing and author history can add up
+// to the threshold without it (a prod deploy by a repeat offender from the right
+// team, in the right hour), but then nothing links the deploy to the service that
+// spiked, and an alert would be a guess presented as an answer.
+func alertable(e models.BlameEdge) bool {
+	if e.ConfidenceScore < HighConfidenceThreshold {
+		return false
+	}
+	for _, f := range e.ConfidenceFactors {
+		if f.Name == "service_match" {
+			return f.Score > 0
+		}
+	}
+	return false
 }
 
 // alertCutoff is the oldest edge creation time whose alert is still worth
