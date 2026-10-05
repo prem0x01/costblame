@@ -42,3 +42,21 @@ func TestDeployEventID(t *testing.T) {
 		}
 	}
 }
+
+func TestBlameEdgeID(t *testing.T) {
+	snap, deploy := uuid.New(), uuid.New()
+
+	first, again := BlameEdgeID(snap, deploy), BlameEdgeID(snap, deploy)
+	if first != again {
+		t.Error("edge ID is not deterministic for the same (snapshot, deploy) pair")
+	}
+	if BlameEdgeID(snap, deploy) == BlameEdgeID(snap, uuid.New()) {
+		t.Error("different deploys must give different edges")
+	}
+	if BlameEdgeID(snap, deploy) == BlameEdgeID(uuid.New(), deploy) {
+		t.Error("different snapshots must give different edges")
+	}
+	if BlameEdgeID(snap, deploy) == BlameEdgeID(deploy, snap) {
+		t.Error("the pair is ordered: (snapshot, deploy) is not (deploy, snapshot)")
+	}
+}

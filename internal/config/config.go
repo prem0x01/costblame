@@ -68,13 +68,32 @@ type CostConfig struct {
 	PollInterval    time.Duration `mapstructure:"poll_interval"`
 	LookbackDays    int           `mapstructure:"lookback_days"`         // baseline window for z-score
 	AnomalyMinDelta float64       `mapstructure:"anomaly_min_delta_pct"` // minimum % increase to flag
-	AWS             AWSCostConfig `mapstructure:"aws"`
+	// ZScoreThreshold is the robust (median/MAD) z-score above which spend is
+	// anomalous. 3.5 is the conventional cut-off for MAD-based scores.
+	ZScoreThreshold float64 `mapstructure:"zscore_threshold"`
+	// MinHistoryDays is how many days with spend a service needs before it can
+	// be flagged; with less it is still "learning". 0 disables the check.
+	MinHistoryDays int `mapstructure:"min_history_days"`
+	// SameWeekdayBaseline compares a day with the same weekday only, so weekly
+	// patterns (a Saturday batch job) are not flagged.
+	SameWeekdayBaseline bool `mapstructure:"same_weekday_baseline"`
+	// SigmaFloorUSD is the smallest spread ever used when scoring, so tiny
+	// services do not flag on pennies.
+	SigmaFloorUSD float64       `mapstructure:"sigma_floor_usd"`
+	AWS           AWSCostConfig `mapstructure:"aws"`
 }
 
 // AWSCostConfig holds settings specific to the AWS Cost Explorer adapter.
 type AWSCostConfig struct {
 	Region      string `mapstructure:"region"`
 	Granularity string `mapstructure:"granularity"` // "DAILY" or "HOURLY"
+	// TagKeys maps the roles the scorer understands (team, env) to the cost
+	// allocation tag keys used in your AWS account, e.g. {team: Team, env:
+	// Environment}. When set, each anomalous service is annotated with the tag
+	// value whose spend rose most, at the cost of one extra Cost Explorer call
+	// per role per poll while an anomaly exists. The tags must be activated as
+	// cost allocation tags in the Billing console. YAML only; empty disables it.
+	TagKeys map[string]string `mapstructure:"tag_keys"`
 }
 
 // SourcesConfig configures deploy event sources. Each filled-in sub-section
@@ -108,6 +127,13 @@ type GitHubSourceConfig struct {
 // Enabled when webhook_secret is set (or GITLAB_WEBHOOK_SECRET is present).
 type GitLabSourceConfig struct {
 	WebhookSecret string `mapstructure:"webhook_secret"`
+	// Token is a GitLab access token with read_api scope. With it, each deploy's
+	// changed files are fetched from the commit's diff so services can be
+	// inferred from them. Without it, only correlation.service_map applies.
+	Token string `mapstructure:"token"`
+	// BaseURL is the GitLab root for self-managed instances
+	// (default https://gitlab.com).
+	BaseURL string `mapstructure:"base_url"`
 }
 
 // ArgoCDSourceConfig holds settings for the ArgoCD webhook adapter. It is an
@@ -168,8 +194,31 @@ type CorrelationConfig struct {
 	LookbackWindow time.Duration `mapstructure:"lookback_window"`
 	// HighConfidenceThreshold triggers immediate narrative generation and alerting.
 	HighConfidenceThreshold float64 `mapstructure:"high_confidence_threshold"`
+	// RescoreWindow is how long after first scoring an anomaly keeps being
+	// re-scored, so deploys and PR enrichment that arrive late are still weighed.
+	// 0 disables re-scoring.
+	RescoreWindow time.Duration `mapstructure:"rescore_window"`
+	// ServiceMap assigns services to every deploy from a repository or ArgoCD
+	// application, so sources that cannot list changed files can still match a
+	// spiking service. YAML only.
+	ServiceMap []ServiceMapEntry `mapstructure:"service_map"`
+	// PathPatterns adds file-path rules, checked before the built-in ones. YAML only.
+	PathPatterns []PathPatternEntry `mapstructure:"path_patterns"`
 	// MinScoreToStore discards edges below this score to keep the DB clean.
 	MinScoreToStore float64 `mapstructure:"min_score_to_store"`
+}
+
+// ServiceMapEntry maps a repository path, repository URL or ArgoCD application
+// name (glob, case-insensitive; "*" matches any run of characters) to services.
+type ServiceMapEntry struct {
+	Match    string   `mapstructure:"match"`
+	Services []string `mapstructure:"services"`
+}
+
+// PathPatternEntry maps changed files whose path contains Pattern to a service.
+type PathPatternEntry struct {
+	Pattern string `mapstructure:"pattern"`
+	Service string `mapstructure:"service"`
 }
 
 // Load reads configuration from environment variables and an optional config file.
@@ -187,12 +236,18 @@ func Load(cfgFile string) (*Config, error) {
 	v.SetDefault("cost.poll_interval", "15m")
 	v.SetDefault("cost.lookback_days", 30)
 	v.SetDefault("cost.anomaly_min_delta_pct", 20.0)
+	v.SetDefault("cost.zscore_threshold", 3.5)
+	v.SetDefault("cost.min_history_days", 7)
+	v.SetDefault("cost.same_weekday_baseline", false)
+	v.SetDefault("cost.sigma_floor_usd", 1.0)
 	v.SetDefault("cost.aws.region", "us-east-1")
 	v.SetDefault("cost.aws.granularity", "DAILY")
 	v.SetDefault("sources.github.webhook_secret", "")
 	v.SetDefault("sources.github.token", "")
 	v.SetDefault("sources.github.deploy_workflows", []string{})
 	v.SetDefault("sources.gitlab.webhook_secret", "")
+	v.SetDefault("sources.gitlab.token", "")
+	v.SetDefault("sources.gitlab.base_url", "https://gitlab.com")
 	v.SetDefault("sources.argocd.enabled", false)
 	v.SetDefault("sources.argocd.token", "")
 	v.SetDefault("llm.provider", "") // empty = auto-detect from environment
@@ -208,6 +263,7 @@ func Load(cfgFile string) (*Config, error) {
 	v.SetDefault("correlation.lookback_window", "72h")
 	v.SetDefault("correlation.high_confidence_threshold", 0.65)
 	v.SetDefault("correlation.min_score_to_store", 0.10)
+	v.SetDefault("correlation.rescore_window", "24h")
 
 	v.SetEnvPrefix("COSTBLAME")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
@@ -260,6 +316,7 @@ func applyEnvFallbacks(cfg *Config) {
 	fallback(&cfg.Sources.GitHub.WebhookSecret, "GITHUB_WEBHOOK_SECRET")
 	fallback(&cfg.Sources.GitHub.Token, "GITHUB_TOKEN")
 	fallback(&cfg.Sources.GitLab.WebhookSecret, "GITLAB_WEBHOOK_SECRET")
+	fallback(&cfg.Sources.GitLab.Token, "GITLAB_TOKEN")
 	fallback(&cfg.Sources.ArgoCD.Token, "ARGOCD_WEBHOOK_TOKEN")
 	fallback(&cfg.Notify.Slack.BotToken, "SLACK_BOT_TOKEN")
 	fallback(&cfg.Notify.Slack.Channel, "SLACK_CHANNEL")

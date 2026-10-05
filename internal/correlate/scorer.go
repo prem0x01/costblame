@@ -38,13 +38,35 @@ func NewScorer(h HistoryReader) *Scorer {
 }
 
 // Score returns the individual ConfidenceFactors for a (anomaly, deploy) pair.
+//
+// A factor that cannot be evaluated (the tag factor when the anomaly carries no
+// usable allocation tags) is skipped: its weight is 0 and the remaining weights
+// are rescaled to sum to 1. Each factor's Weight is therefore its actual share
+// of the total, the total can span the full 0..1 range, and "unknown" no longer
+// adds a fixed 0.10 to every score the way a neutral 0.5 did.
 func (s *Scorer) Score(ctx context.Context, anomaly models.CostSnapshot, deploy models.DeployEvent) []models.ConfidenceFactor {
-	return []models.ConfidenceFactor{
+	return normalizeWeights([]models.ConfidenceFactor{
 		s.temporalScore(anomaly, deploy),
 		s.serviceScore(anomaly, deploy),
 		s.tagScore(anomaly, deploy),
 		s.historicalScore(ctx, anomaly, deploy),
+	})
+}
+
+// normalizeWeights rescales factor weights so they sum to 1. When every factor
+// is applied they already do and nothing changes.
+func normalizeWeights(factors []models.ConfidenceFactor) []models.ConfidenceFactor {
+	var sum float64
+	for _, f := range factors {
+		sum += f.Weight
 	}
+	if sum <= 0 || math.Abs(sum-1) < 1e-9 {
+		return factors
+	}
+	for i := range factors {
+		factors[i].Weight /= sum
+	}
+	return factors
 }
 
 // TotalScore sums all factor contributions into a single [0, 1] confidence score.
@@ -132,14 +154,25 @@ func (s *Scorer) serviceScore(anomaly models.CostSnapshot, deploy models.DeployE
 	var score float64
 	var reason string
 
+	// Compare canonical identities, not raw strings: Cost Explorer reports
+	// "Amazon Elastic Compute Cloud - Compute" where the service map says
+	// "AmazonEC2" (see CanonicalService).
+	target := CanonicalService(anomaly.Service)
 	for _, svc := range deploy.InferredServices {
-		if strings.EqualFold(svc, anomaly.Service) {
+		c := CanonicalService(svc)
+		if c == "" || target == "" {
+			continue
+		}
+		if c == target {
 			score = 1.0
-			reason = "exact service match: " + svc
+			reason = "exact service match: " + svc + " = " + anomaly.Service
 			break
 		}
-		// Fuzzy: "ecs" in a path matches "AmazonECS" service name.
-		if serviceContains(anomaly.Service, svc) && score < 0.70 {
+		// Partial: the anomaly's service name contains the inferred one
+		// ("Amazon Kinesis Firehose" ~ Kinesis). Names that merely start with
+		// another service's name are aliased to their own identity instead (see
+		// serviceAliases), so they cannot borrow its credit.
+		if len(c) >= minPartialLen && strings.Contains(target, c) && score < 0.70 {
 			score = 0.70
 			reason = "partial service match: " + svc + " ~ " + anomaly.Service
 		}
@@ -154,42 +187,34 @@ func (s *Scorer) serviceScore(anomaly models.CostSnapshot, deploy models.DeployE
 	}
 }
 
-// tagScore compares the anomaly's resource tags against the deploy's team/env metadata.
-// When the anomaly has no tags, the factor returns a neutral 0.5 — unknown, not negative.
+// tagScore compares the anomaly's team and env tags with the deploy (see
+// tagEvidence). It is skipped (weight 0) when there is nothing to compare: no
+// tags, tags that are not team/env, or a deploy whose environment and team
+// cannot be told. Unknown is not evidence for or against, and Score rescales the
+// other weights.
 func (s *Scorer) tagScore(anomaly models.CostSnapshot, deploy models.DeployEvent) models.ConfidenceFactor {
-	if len(anomaly.Tags) == 0 {
+	skipped := func(why string) models.ConfidenceFactor {
 		return models.ConfidenceFactor{
-			Name: "tag_match", Score: 0.5, Weight: weightTag,
-			Reason: "no tags on anomaly — neutral score applied",
+			Name: "tag_match", Score: 0, Weight: 0,
+			Reason: why + " — factor not applied, other weights rescaled",
 		}
 	}
-
-	matches, checks := 0, 0
-
-	if team := anomaly.Tags["team"]; team != "" {
-		checks++
-		if strings.EqualFold(team, deploy.PRTeam) || strings.EqualFold(team, repoToTeam(deploy.Repository)) {
-			matches++
-		}
+	if len(anomaly.Tags) == 0 {
+		return skipped("no team/env allocation tags on the anomaly")
+	}
+	if anomaly.Tags["team"] == "" && anomaly.Tags["env"] == "" {
+		return skipped("the anomaly's tags include no team or env tag")
 	}
 
-	if env := anomaly.Tags["env"]; env != "" {
-		checks++
-		if strings.EqualFold(env, deploy.Environment) {
-			matches++
-		}
+	matches, checks, reason := tagEvidence(anomaly.Tags, deploy)
+	if checks == 0 {
+		return skipped("the deploy's environment and team cannot be compared with the anomaly's tags")
 	}
-
-	var score float64
-	if checks > 0 {
-		score = float64(matches) / float64(checks)
-	}
-
 	return models.ConfidenceFactor{
 		Name:   "tag_match",
-		Score:  score,
+		Score:  float64(matches) / float64(checks),
 		Weight: weightTag,
-		Reason: fmt.Sprintf("%d/%d resource tags matched", matches, checks),
+		Reason: fmt.Sprintf("%d/%d tags matched (%s)", matches, checks, reason),
 	}
 }
 
@@ -204,19 +229,4 @@ func (s *Scorer) historicalScore(ctx context.Context, anomaly models.CostSnapsho
 		Weight: weightHistorical,
 		Reason: fmt.Sprintf("%d prior confirmed blame(s) for %s on %s", count, deploy.PRAuthor, anomaly.Service),
 	}
-}
-
-// repoToTeam extracts a simple team slug from "org/team-service" style repo names.
-// e.g. "acme/payments-api" → "payments".
-func repoToTeam(repo string) string {
-	parts := strings.SplitN(repo, "/", 2)
-	if len(parts) < 2 {
-		return repo
-	}
-	name := parts[1]
-	// Strip common suffixes: -api, -service, -worker, -backend
-	for _, suffix := range []string{"-api", "-service", "-worker", "-backend", "-server"} {
-		name = strings.TrimSuffix(name, suffix)
-	}
-	return name
 }

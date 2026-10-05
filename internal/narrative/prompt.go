@@ -87,7 +87,7 @@ COST ANOMALY
   Service    : %s
   Period     : %s → %s
   Amount     : $%.2f (was $%.2f, +%.1f%%)
-  Anomaly    : %.1f standard deviations above 30-day baseline
+  Anomaly    : %.1f deviations above the 30-day median (MAD-scaled, comparable to standard deviations)
   Tags       : %s
 
 MOST LIKELY DEPLOYMENT

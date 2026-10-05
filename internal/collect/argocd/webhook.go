@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prem0x01/costblame/internal/correlate"
 	"github.com/prem0x01/costblame/pkg/models"
 )
 
@@ -21,14 +22,20 @@ import (
 type WebhookHandler struct {
 	token string
 	ch    chan models.DeployEvent
+	sm    *correlate.ServiceMap
 }
 
 // New creates a WebhookHandler for ArgoCD application events. Requests must
 // carry `Authorization: Bearer <token>`; configure that header on ArgoCD's
 // notifications webhook service. An empty token rejects every request, since an
 // unauthenticated receiver would let anyone inject deploys.
-func New(token string) *WebhookHandler {
-	return &WebhookHandler{token: token, ch: make(chan models.DeployEvent, 256)}
+//
+// An ArgoCD sync event carries no changed files, author or pull request, so the
+// only way its deploys can match a spiking service is serviceMap: rules that
+// match the application name, the repository URL or its owner/repo path. Nil
+// means no rules, and such deploys cannot reach the alert threshold.
+func New(token string, serviceMap *correlate.ServiceMap) *WebhookHandler {
+	return &WebhookHandler{token: token, ch: make(chan models.DeployEvent, 256), sm: serviceMap}
 }
 
 // Name implements collect.DeploySource.
@@ -139,6 +146,9 @@ func (h *WebhookHandler) parse(body []byte) error {
 		Environment: ev.Spec.Destination.Namespace,
 		Status:      models.DeployStatusSuccess,
 		RawPayload:  body,
+		// Rules may name the application ("payments"), the repository URL, or
+		// its owner/repo path ("acme/infra").
+		InferredServices: h.sm.ForKeys(ev.Metadata.Name, ev.Spec.Source.RepoURL, correlate.RepoPath(ev.Spec.Source.RepoURL)),
 	}
 
 	select {

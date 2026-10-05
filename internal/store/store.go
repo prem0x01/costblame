@@ -49,11 +49,21 @@ type Store interface {
 
 	// --- BlameEdge ---
 
-	// SaveBlameEdges bulk-inserts blame edges. Duplicate IDs are ignored.
+	// SaveBlameEdges writes edges atomically and idempotently, keyed by their
+	// (cost snapshot, deploy) pair. An existing pending edge is refreshed; an edge
+	// that has moved past pending is left untouched.
 	SaveBlameEdges(ctx context.Context, edges []models.BlameEdge) error
 
-	// UpdateBlameEdge updates the narrative, status, and confidence score of an existing edge.
-	UpdateBlameEdge(ctx context.Context, edge models.BlameEdge) error
+	// UnalertedEdges returns resolved edges, created at or after since, whose
+	// alert has not been delivered (the alert outbox).
+	UnalertedEdges(ctx context.Context, since time.Time) ([]models.BlameEdge, error)
+
+	// MarkEdgeAlerted records that an edge's alert was delivered.
+	MarkEdgeAlerted(ctx context.Context, id uuid.UUID) error
+
+	// RecentlyScoredAnomalies returns anomalies first scored at or after since,
+	// so the engine can re-score them when late deploys or enrichment arrive.
+	RecentlyScoredAnomalies(ctx context.Context, since time.Time) ([]models.CostSnapshot, error)
 
 	// UpdateBlameStatus changes only the status of an existing edge, leaving
 	// narrative, score, and factors intact. Returns sql.ErrNoRows if no edge

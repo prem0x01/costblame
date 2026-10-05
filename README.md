@@ -26,7 +26,7 @@ One self-hosted Go binary. It watches your cloud spend, listens to your CI/CD pi
  you            : "why is the bill up 145%?"
  costblame      : "PR #847 by @alice — provisioned concurrency on the
                    payment function, deployed 6h before the spike.
-                   Confidence 0.79. Here's the revert suggestion."
+                   Confidence 0.86. Here's the revert suggestion."
  time elapsed   : 4 seconds
  dashboards open: 0
 ```
@@ -61,7 +61,7 @@ Cloud bills spike. Everyone has seen it: serverless invocations explode overnigh
 |---|---|---|
 | **Detection** | Someone notices the bill — days later | Anomaly flagged on the next poll, minutes after billing data lands |
 | **Investigation** | 30–90 min of cross-referencing deploy logs, Git history, billing dashboards | Automatic — scored candidates ranked by evidence |
-| **The answer** | "Probably something we shipped last week?" | *"PR #847 by @alice, 6h before the spike, confidence 0.79"* |
+| **The answer** | "Probably something we shipped last week?" | *"PR #847 by @alice, 6h before the spike, confidence 0.86"* |
 | **The follow-up** | A meeting | A Slack message with a suggested fix, and a one-click confirm/dismiss |
 | **Next time** | Start from scratch | Confirmed blames sharpen future scoring |
 
@@ -73,7 +73,7 @@ That investigation tax is paid on *every single spike*. `costblame` pays it once
 
 Six steps, fully automatic:
 
-1. **Polls your cloud billing API** on a configurable interval. For each service, it computes a rolling 30-day baseline and flags anything more than 2 standard deviations above it as an anomaly.
+1. **Polls your cloud billing API** on a configurable interval. For each service, it computes a rolling 30-day baseline (median and MAD, so past spikes don't hide new ones) and flags spend that is a robust z-score above 3.5 over it as an anomaly.
 2. **Ingests deploy events** from your CI/CD via webhooks, enriching each one asynchronously with PR metadata and changed file paths.
 3. **Scores every deployment** from the 72 hours before the anomalous cost period through the end of that period on four independent, explainable factors. The weighted sum is the confidence score — no black box.
 4. **Generates a narrative** — a 2–3 sentence plain-English explanation of what spiked, what probably caused it, and what to do next. Uses your LLM if you configure one, clean templates if you don't. **An LLM is never required.**
@@ -134,7 +134,7 @@ The whole system is one process. Data flows top to bottom: the outside world fee
 ║  │                         │  │                              │      │        ║
 ║  │ · rolling 30-day        │  │ · POST /webhooks/<source>    │      │        ║
 ║  │   baseline per service  │  │ · signature check, then      │      │        ║
-║  │ · z-score > 2σ  AND     │  │   202 Accepted in ~1 ms      │      │        ║
+║  │ · robust z > 3.5 AND    │  │   202 Accepted in ~1 ms      │      │        ║
 ║  │   Δ ≥ 20%  ⇒  anomaly   │  │ · PR + changed files         │      │        ║
 ║  │                         │  │   enriched in background     │      │        ║
 ║  └────────────┬────────────┘  └───────────────┬──────────────┘      │        ║
@@ -179,7 +179,7 @@ The whole system is one process. Data flows top to bottom: the outside world fee
 
 ### ❶ The cost collector — *pull*
 
-A `collect.CostSource` adapter polls your billing API on `cost.poll_interval` (default 15m). For every service it sees, it maintains a rolling 30-day baseline (mean and standard deviation of daily spend). A reading is flagged as an anomaly only when **both** conditions hold: the z-score exceeds 2.0 *and* the relative increase beats `anomaly_min_delta_pct` (default 20%). The double condition matters — the z-score catches statistically unusual jumps, while the minimum delta filters out "statistically unusual but who cares" noise on near-zero services. Anomalies land in the store as `CostSnapshot` rows with `is_anomaly = true`.
+A `collect.CostSource` adapter polls your billing API on `cost.poll_interval` (default 15m). For every service it sees, it maintains a rolling 30-day baseline of daily spend (days with no billing count as zero). The baseline uses the **median and the median absolute deviation (MAD)** rather than the mean and standard deviation: a past spike does not inflate it and hide the next one, and a perfectly flat history still has a usable spread (a floor derived from `anomaly_min_delta_pct` and `zscore_threshold`, so a flat series is flagged as soon as it rises by the minimum delta, and at least `sigma_floor_usd`), so $5/day jumping to $500 is caught, and so is a steady $1,000/day service rising 25%. A reading is flagged as an anomaly only when **both** conditions hold: the robust z-score exceeds `zscore_threshold` (default 3.5, the conventional cut-off for MAD scores) *and* the relative increase beats `anomaly_min_delta_pct` (default 20%). The double condition matters — the z-score catches statistically unusual jumps, while the minimum delta filters out "statistically unusual but who cares" noise on near-zero services. Services with fewer than `min_history_days` days of spend (default 7) are still *learning* and are never flagged; services that bill on fewer than half of the days are compared against their own billed days, so a normal run is not a spike. Set `same_weekday_baseline: true` to compare each day only with the same weekday, which suppresses weekly patterns such as a Saturday batch job. Anomalies land in the store as `CostSnapshot` rows with `is_anomaly = true`.
 
 ### ❷ The deploy receivers — *push*
 
@@ -200,9 +200,13 @@ SQLite in WAL mode — chosen deliberately. costblame's write volume (a few rows
 
 The brain. On every poll tick it asks one question: *are there anomalies nobody has blamed yet?* For each one it pulls every deploy in the preceding `lookback_window` (default 72h) and hands each `(anomaly, deploy)` pair to the scorer — a stateless, fully unit-tested function that returns four named factors and their weighted sum (see [Confidence Scoring](#confidence-scoring)). Then it triages by score: below `min_score_to_store` (0.10) the pair is discarded; up to `high_confidence_threshold` (0.65) it's stored as `pending` for humans to browse; at or above 0.65 the engine **acts** — step ❺.
 
+The engine is built to be re-run safely. An edge is identified by its `(anomaly, deploy)` pair (a unique index enforces it), so scoring the same pair twice updates one row instead of inserting another. A still-`pending` edge is refreshed with the new score; an edge that has been alerted, confirmed or dismissed is never overwritten. Anomalies keep being re-scored (at most once every five minutes) for `correlation.rescore_window` (default 24h) after they are first scored, so a deploy webhook that arrives late, or PR enrichment that finally supplies the changed files, can still produce or upgrade a blame. Re-scoring with nothing new writes nothing, and a given anomaly is alerted about once — a stronger candidate that appears later is stored as `pending`, not announced again.
+
 ### ❺ Narrative + alert
 
-For high-confidence edges only, the engine asks the `NarrativeGenerator` for a 2–3 sentence explanation written for a human at 9am: what spiked, by how much, which deploy is implicated, and what to consider doing. The generator is whichever LLM adapter you configured — Anthropic, OpenAI, a local Ollama model, any OpenAI-compatible endpoint — or the built-in template that needs no network calls at all. The result fans out through every configured `notify.Notifier` simultaneously; a failing notifier is logged and skipped, never blocking the others.
+For high-confidence edges only, the engine asks the `NarrativeGenerator` for a 2–3 sentence explanation written for a human at 9am: what spiked, by how much, which deploy is implicated, and what to consider doing. The generator is whichever LLM adapter you configured — Anthropic, OpenAI, a local Ollama model, any OpenAI-compatible endpoint — or the built-in template that needs no network calls at all. The result is sent through every configured `notify.Notifier` in turn; a failing notifier is logged and never stops the others.
+
+Alerts are delivered through an outbox: an edge is only marked as alerted after a notifier accepts it. If delivery fails (Slack is down, the webhook times out), the alert stays queued and is retried every cycle for up to 48 hours instead of being lost, and an anomaly processed twice after a crash does not send twice. Delivery is therefore **at-least-once**: when one of several notifiers fails, the alert is retried and the ones that already succeeded may receive it again.
 
 ### ❻ The feedback loop
 
@@ -225,18 +229,43 @@ Every `(anomaly, deployment)` pair is scored by four independent factors. The we
 |--------|--------|---------------------|
 | `temporal_proximity` | **40%** | A deploy *during* the cost period scores 1.0 (0.5 if it landed in the last quarter of the period and had little time to accrue cost). For earlier deploys, a decay curve measured back from the period start: 1.0 within 2h, 0.85 within 6h, 0.60 within 24h, 0.30 within 48h, 0.10 within 72h, 0.0 beyond. Deploys after the period ended score 0 |
 | `service_match` | **30%** | 1.0 if the deploy's inferred cloud services (from changed file paths) exactly match the anomalous service; 0.7 for a partial match; 0.0 for no match |
-| `tag_match` | **20%** | Compares cost allocation tags (`team`, `env`) on the anomaly against the deployment's repository and environment metadata |
+| `tag_match` | **20%** | Compares cost allocation tags (`team`, `env`) on the anomaly against the deployment's repository and environment metadata. **Skipped when the anomaly has no such tags** |
 | `historical_pattern` | **10%** | Boosts the score if the same author has caused *confirmed* cost spikes on the same service before (capped at 4 prior incidents) |
+
+**When a factor can't be evaluated it is skipped, not guessed.** Cost Explorer results carry no allocation tags unless you ask for them (see below), so by default `tag_match` is skipped and the other three weights are rescaled to sum to 100% (temporal 50%, service 37.5%, history 12.5%). Each blame edge shows the effective weights, so the numbers always add up to the score. An earlier version scored the missing tags as a neutral 0.5, which quietly added a fixed 0.10 to every score and capped the maximum at 0.90. Independently of the score, **an alert always requires a service match**: timing, tags and author history can add up to the threshold on their own (a prod deploy by a repeat offender from the right team, in the right hour), but then nothing links the deploy to the service that spiked. Such a candidate is stored as `pending`, and if another candidate has a service match and clears the threshold, that one is alerted instead.
+
+#### Turning on `tag_match`
+
+1. In the AWS Billing console, activate your team and environment tags as **cost allocation tags** (Billing → Cost allocation tags). Cost Explorer only returns tags that are activated, and only for usage after activation.
+2. Tell costblame which AWS tag keys hold the team and the environment:
+
+```yaml
+cost:
+  aws:
+    tag_keys:
+      team: Team            # the scorer role -> your AWS tag key
+      env: Environment
+```
+
+When an anomaly is detected, costblame asks Cost Explorer which tag value the extra spend came from (the value whose spend *rose* the most, not the biggest spender) and records it on the anomaly as `team` / `env`. If the increase is mostly untagged spend, no tag is recorded: an unknown owner stays unknown.
+
+The tags are then compared with the deploy, forgiving spelling: **environment** is read as a class, so `Production`, `prod`, `prd`, `live` and `payments-prod` are all production, while `preprod`, `pre-production` and `non-prod` are staging. It is compared only when both sides name a recognisable environment; an ArgoCD namespace such as `payments`, or `unknown`, means "can't tell" and is skipped, not counted as a mismatch. A staging deploy blamed for production spend *is* a real mismatch and scores against the deploy. **Team** only corroborates: the tag is matched against the repository's name (`acme/checkout-payments-api` is `checkout-payments`, `checkout` or `payments`) or a team label, and a match counts in the deploy's favour, but a team that doesn't match is not held against it, since teams don't always name their repositories after themselves. If nothing can be compared, the factor is skipped and the other weights are rescaled, so turning tags on can never cost a correct alert its score through spelling alone. Detection itself is unchanged and stays per service; tags only annotate anomalies, so each service still has one baseline and one snapshot per day.
+
+Cost Explorer allows two `GroupBy` entries, so each role costs **one extra Cost Explorer request per poll while an anomaly exists** (about $0.01 each; none when there is no anomaly). A tag query that fails is logged and ignored, and `tag_match` is skipped as before.
 
 **Thresholds:**
 
 - `score < 0.10` — discarded, not stored
 - `0.10 ≤ score < 0.65` — stored as a `pending` blame edge, no alert
-- `score ≥ 0.65` — narrative generated, alert sent, status set to `resolved`
+- `score ≥ 0.65` **and a service match** — narrative generated, alert sent, status set to `resolved` (one alert per anomaly)
 
 ### Service inference from file paths
 
-Changed files are mapped to billable cloud services using a pattern table. The mapping ships tuned for the built-in cost adapter's service names and lives in `internal/correlate/service_map.go` — extend it to match your infra layout and provider:
+Changed files are mapped to billable cloud services using a pattern table that lives in `internal/correlate/service_map.go` — extend it to match your infra layout and provider.
+
+**Service names are matched by identity, not spelling.** AWS Cost Explorer reports display names (`Amazon Elastic Compute Cloud - Compute`, `AWS Lambda`, `Amazon Simple Storage Service`, `EC2 - Other`), while people write product codes (`AmazonEC2`, `AWSLambda`) or short names (`ec2`, `lambda`, `s3`). All of these are recognised as the same service, ignoring case, spacing and punctuation, so a deploy that touches `terraform/lambda/` matches a spike on `AWS Lambda`. Services the table does not know still match when they differ only in case, spacing or punctuation, and a name contained in the spiking service's name (at least three characters) is a partial match.
+
+The default patterns:
 
 | File path pattern | Inferred service |
 |---|---|
@@ -247,6 +276,38 @@ Changed files are mapped to billable cloud services using a pattern table. The m
 | `terraform/dynamodb/`, `dynamo*` | NoSQL DB |
 | `k8s/`, `kubernetes/`, `helm/` | managed Kubernetes |
 | `terraform/ec2/`, `terraform/alb/` | VMs / load balancing |
+
+### What each source can tell the scorer
+
+The service match is worth 30% of a score, and **a deploy with no service match cannot reach the 0.65 alert threshold** (its best possible score is 0.625). So what a source can learn about a deploy decides whether it can ever alert:
+
+| Source | PR / author | Changed files → services | Without extra setup |
+|---|---|---|---|
+| GitHub | PR number, title, author, labels (needs `sources.github.token`) | PR file list (needs the token) | No token: only a `correlation.service_map` rule |
+| GitLab | MR title and author when the pipeline has one; otherwise the pipeline's user, then the commit author | The commit's diff via the API (needs `sources.gitlab.token`, `read_api`) | No token: only a `correlation.service_map` rule |
+| ArgoCD | none — a sync event carries no author or PR | none — a sync event carries no files | Only a `correlation.service_map` rule |
+
+`costblame serve` logs a warning at startup for any enabled source that has neither a token nor a rule, since its deploys would be stored but could never alert.
+
+#### Service map
+
+A service-map rule assigns services to every deploy from a repository or ArgoCD application, whatever it changed. Put it in `costblame.yaml` (it is not available as an environment variable):
+
+```yaml
+correlation:
+  service_map:
+    - match: acme/payments-api        # repository path (GitHub/GitLab), ArgoCD app name, or repo URL
+      services: [AWS Lambda, DynamoDB]
+    - match: acme/data-*              # * matches any run of characters, including "/"; case is ignored
+      services: [s3]
+    - match: payments                 # an ArgoCD application name
+      services: [lambda, RDS]
+  path_patterns:                      # extra file-path rules, checked before the built-in ones
+    - pattern: services/billing/
+      service: DynamoDB
+```
+
+Service names can be written as Cost Explorer display names, product codes or short names — see [service names](#service-inference-from-file-paths) above. For ArgoCD, a rule may match the application name, the repository URL or its `owner/repo` path. Rules combine with what files reveal: a deploy's services are the union of both. Rules that could never match (an empty `match`, no `services`) are rejected at startup.
 
 ---
 
@@ -273,7 +334,7 @@ A real run, end to end. (This example uses the default adapter stack — swap an
          │
          ▼
 4. costblame's next poll catches it
-   → z-score = 3.8 (> 2.0 threshold)
+   → robust z-score = 3.8 (> 3.5 threshold)
    → CostSnapshot saved with is_anomaly = true
          │
          ▼
@@ -283,15 +344,15 @@ A real run, end to end. (This example uses the default adapter stack — swap an
          │
          ▼
 6. The scorer shows its work:
-   temporal_proximity : 0.85  (6h window)   × 0.40 = 0.34
-   service_match      : 1.00  (exact match) × 0.30 = 0.30
-   tag_match          : 0.50  (neutral)     × 0.20 = 0.10
-   historical_pattern : 0.50  (2 prior)     × 0.10 = 0.05
+   temporal_proximity : 0.85  (6h window)   × 0.500 = 0.425
+   service_match      : 1.00  (exact match) × 0.375 = 0.375
+   tag_match          : skipped (the anomaly has no tags; weights rescaled)
+   historical_pattern : 0.50  (2 prior)     × 0.125 = 0.063
                                               ─────────
-                                    TOTAL:      0.79  ✓
+                                    TOTAL:      0.86  ✓
          │
          ▼
-7. Score 0.79 ≥ 0.65 → high confidence
+7. Score 0.86 ≥ 0.65 → high confidence
    → narrative generated:
      "Cost for serverless compute increased 145% (USD 155 → USD 380)
       on Jun 10. PR #847 (feat: enable provisioned concurrency) by
@@ -359,6 +420,10 @@ costblame tui       # terminal UI (separate terminal)
 costblame report    # print the blame table to stdout
 ```
 
+### Upgrading
+
+`costblame serve` and `costblame migrate` apply schema migrations automatically, each inside a transaction. **Back up the database first** (copy `costblame.db`, including any `-wal`/`-shm` files, or run `sqlite3 costblame.db ".backup costblame.bak"`). Migration `003` merges duplicate blame edges, keeping one that a human reviewed, and deletes the extra rows; it also backfills alert bookkeeping so alerts that were already handled are not re-sent after the upgrade.
+
 ---
 
 ## CLI Reference
@@ -384,7 +449,11 @@ Everything lives in `costblame.yaml` **or** environment variables — env wins, 
 cost:
   provider: aws                 # billing adapter — implement collect.CostSource to add more
   poll_interval: 15m
-  lookback_days: 30             # baseline window for z-score
+  lookback_days: 30             # baseline window (days)
+  zscore_threshold: 3.5         # robust (median/MAD) z-score that counts as a spike
+  min_history_days: 7           # days with spend needed before a service can be flagged
+  same_weekday_baseline: false  # compare with the same weekday only
+  sigma_floor_usd: 1.0          # smallest spread used; stops pennies on tiny services flagging
   anomaly_min_delta_pct: 20.0   # ignore spikes smaller than this
   aws:                          # settings for the selected provider
     region: us-east-1
@@ -404,6 +473,8 @@ sources:                        # CI/CD adapters — filled in = enabled
     deploy_workflows: []        # e.g. ["Deploy", "release.yml"]; empty = any push-triggered run on main
   gitlab:
     webhook_secret: ""          # set to enable /webhooks/gitlab
+    token: ""                   # optional, read_api — fetches each commit's changed files
+    base_url: https://gitlab.com   # set for self-managed GitLab
   argocd:
     enabled: false              # explicit opt-in
     token: ""                   # required — ArgoCD sends it as "Authorization: Bearer <token>"
@@ -426,6 +497,7 @@ notify:                         # every configured destination gets the alert
 correlation:
   interval: 1m                  # how often new anomalies are scored (cheap, local)
   lookback_window: 72h
+  rescore_window: 24h           # keep re-scoring an anomaly this long, so late deploys/enrichment count (0 = off)
   high_confidence_threshold: 0.65
   min_score_to_store: 0.10
 ```
@@ -444,7 +516,7 @@ Any YAML key maps to `COSTBLAME_<SECTION>_<KEY>` (dots become underscores): `COS
 | `OLLAMA_HOST` | Narratives via a local Ollama server |
 | `GITHUB_WEBHOOK_SECRET`, `GITHUB_TOKEN` | Enables the GitHub source (secret required; token adds PR enrichment) |
 | `COSTBLAME_SOURCES_GITHUB_DEPLOY_WORKFLOWS` | Comma-separated workflows that count as deploys, e.g. `Deploy,release.yml` |
-| `GITLAB_WEBHOOK_SECRET` | Enables the GitLab source |
+| `GITLAB_WEBHOOK_SECRET`, `GITLAB_TOKEN` | Enables the GitLab source; the token (`read_api`) adds changed-file enrichment |
 | `ARGOCD_WEBHOOK_TOKEN` | Bearer token ArgoCD must send (required to enable the ArgoCD source) |
 | `COSTBLAME_SERVER_API_TOKEN` | Token for the web UI and `/api` (generated at startup if unset) |
 | `SLACK_BOT_TOKEN`, `SLACK_CHANNEL` | Enables Slack alerts |
@@ -525,9 +597,13 @@ Whatever the filter, these are never deploys: `schedule` and `pull_request*` tri
 
 Successful pipelines on `main`/`master`/`release/*`/`deploy/*` branches are treated as deploys.
 
+Set `sources.gitlab.token` (or `GITLAB_TOKEN`) to a token with `read_api` scope, and `sources.gitlab.base_url` for a self-managed instance. Each deploy's changed files are then fetched from the commit's diff (up to 1,000 files) and mapped to services. Without a token, add a [service-map rule](#service-map) or GitLab deploys cannot match a service.
+
 ### Deploy events: ArgoCD
 
 Set `sources.argocd.enabled: true` and `sources.argocd.token` (or `ARGOCD_WEBHOOK_TOKEN`), then point an ArgoCD notification webhook at `https://your-host:7890/webhooks/argocd` with the header `Authorization: Bearer <token>`. Without a token the receiver is not mounted — an open endpoint would let anyone inject fake deploys and frame an author.
+
+A sync event carries no changed files, author or PR, so ArgoCD deploys can only match a service through a [service-map rule](#service-map) on the application name or repository. Without one they are stored as candidates but can never reach the alert threshold.
 
 ### Narratives: any LLM, or none
 
@@ -555,7 +631,7 @@ Slack uses a bot token + channel ID. For every other tool — incident managemen
   "amount_usd": 380.0,
   "pr_number": 847,
   "pr_author": "alice",
-  "confidence_score": 0.79,
+  "confidence_score": 0.86,
   "narrative": "…",
   "detected_at": "2026-06-10T14:32:00Z"
 }
@@ -620,7 +696,7 @@ No and no. MIT-licensed, self-hosted, yours.
 ## Components
 
 - **`internal/collect`** — the `CostSource` and `DeploySource` interfaces the engine depends on. Cloud- and CI-agnostic.
-- **`internal/collect/aws`** — billing adapter for AWS Cost Explorer: polls cost data, computes the rolling baseline, flags z-score anomalies.
+- **`internal/collect/aws`** — billing adapter for AWS Cost Explorer: polls cost data, computes the rolling median/MAD baseline, flags robust z-score anomalies.
 - **`internal/collect/github`** — deploy adapter for GitHub Actions: validates HMAC-SHA256 webhook signatures, acks immediately (HTTP 202), enriches PR metadata asynchronously.
 - **`internal/collect/gitlab` / `internal/collect/argocd`** — deploy adapters for GitLab CI pipeline events and ArgoCD sync events, following the same two-phase pattern.
 - **`internal/correlate/engine`** — the main loop: finds unblamed anomalies, scores deploy candidates, persists edges, triggers narratives and alerts.

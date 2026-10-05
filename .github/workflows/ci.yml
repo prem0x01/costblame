@@ -48,7 +48,9 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
+          # Pinned: "latest" lets a new linter release (or a major version this
+          # action cannot run) turn the build red without any change to the code.
+          version: v1.64.8
           args: --timeout=5m
 
   docker:

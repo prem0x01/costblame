@@ -37,7 +37,7 @@ func next(h *WebhookHandler, wait time.Duration) (models.DeployEvent, bool) {
 }
 
 func TestPipelineRetriesShareOneDeployID(t *testing.T) {
-	h := New("tok")
+	h := New("tok", Options{})
 	body := pipeline("main", "abc123", "success")
 
 	for i := 0; i < 2; i++ {
@@ -65,7 +65,7 @@ func TestIgnoredPipelines(t *testing.T) {
 		"no commit sha":  pipeline("main", "", "success"),
 	} {
 		t.Run(name, func(t *testing.T) {
-			h := New("tok")
+			h := New("tok", Options{})
 			if rec := post(h, "tok", body); rec.Code != http.StatusAccepted {
 				t.Fatalf("status = %d, want 202", rec.Code)
 			}
@@ -77,14 +77,14 @@ func TestIgnoredPipelines(t *testing.T) {
 }
 
 func TestEmptySecretRejectsEverything(t *testing.T) {
-	h := New("")
+	h := New("", Options{})
 	if rec := post(h, "", pipeline("main", "abc123", "success")); rec.Code != http.StatusUnauthorized {
 		t.Errorf("no header = %d, want 401 (an empty secret must fail closed)", rec.Code)
 	}
 }
 
 func TestWrongTokenRejected(t *testing.T) {
-	h := New("tok")
+	h := New("tok", Options{})
 	if rec := post(h, "nope", pipeline("main", "abc123", "success")); rec.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", rec.Code)
 	}

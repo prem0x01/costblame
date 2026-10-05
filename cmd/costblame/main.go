@@ -124,7 +124,11 @@ func serveCmd() *cobra.Command {
 			}
 
 			// Build every deploy source with credentials configured.
-			deploySources := buildDeploySources(cfg.Sources)
+			serviceMap, err := newServiceMap(cfg.Correlation)
+			if err != nil {
+				return err
+			}
+			deploySources := buildDeploySources(cfg.Sources, serviceMap)
 			if len(deploySources) == 0 {
 				slog.Warn("no deploy sources configured — anomalies will be detected but cannot be blamed on deploys")
 			}
@@ -134,7 +138,7 @@ func serveCmd() *cobra.Command {
 				store, gen, notifier,
 				cfg.Correlation.Interval,
 				cfg.Correlation.MinScoreToStore,
-			)
+			).WithRescoreWindow(cfg.Correlation.RescoreWindow)
 
 			// Start background cost polling.
 			go pollCosts(ctx, costSrc, store, cfg.Cost.PollInterval)
@@ -274,11 +278,11 @@ func buildNotifier(cfg config.NotifyConfig) notify.Notifier {
 // buildDeploySources returns every CI/CD adapter whose credentials are
 // configured (via YAML, COSTBLAME_* env vars, or the conventional
 // GITHUB_*/GITLAB_* env vars). Filling in a source is what enables it.
-func buildDeploySources(cfg config.SourcesConfig) map[string]webhookSource {
+func buildDeploySources(cfg config.SourcesConfig, sm *correlate.ServiceMap) map[string]webhookSource {
 	sources := make(map[string]webhookSource)
 	switch {
 	case cfg.GitHub.WebhookSecret != "":
-		sources["github"] = githubcollect.NewWebhookHandler(cfg.GitHub.WebhookSecret, cfg.GitHub.Token, cfg.GitHub.DeployWorkflows)
+		sources["github"] = githubcollect.NewWebhookHandler(cfg.GitHub.WebhookSecret, cfg.GitHub.Token, cfg.GitHub.DeployWorkflows, sm)
 		if len(cfg.GitHub.DeployWorkflows) == 0 {
 			slog.Info("github: sources.github.deploy_workflows not set — every successful push-triggered " +
 				"workflow run on main/release/deploy branches counts as a deploy (one per commit); " +
@@ -291,11 +295,15 @@ func buildDeploySources(cfg config.SourcesConfig) map[string]webhookSource {
 			"refusing to mount the GitHub webhook receiver; set a webhook secret to enable it")
 	}
 	if cfg.GitLab.WebhookSecret != "" {
-		sources["gitlab"] = gitlabcollect.New(cfg.GitLab.WebhookSecret)
+		sources["gitlab"] = gitlabcollect.New(cfg.GitLab.WebhookSecret, gitlabcollect.Options{
+			Token:      cfg.GitLab.Token,
+			BaseURL:    cfg.GitLab.BaseURL,
+			ServiceMap: sm,
+		})
 	}
 	switch {
 	case cfg.ArgoCD.Enabled && cfg.ArgoCD.Token != "":
-		sources["argocd"] = argocdcollect.New(cfg.ArgoCD.Token)
+		sources["argocd"] = argocdcollect.New(cfg.ArgoCD.Token, sm)
 	case cfg.ArgoCD.Enabled:
 		// Unauthenticated, the endpoint would let anyone inject fake deploys.
 		slog.Warn("sources.argocd.enabled is true but sources.argocd.token is empty — " +
@@ -305,7 +313,52 @@ func buildDeploySources(cfg config.SourcesConfig) map[string]webhookSource {
 	for name := range sources {
 		slog.Info("deploy source enabled", "source", name)
 	}
+	for _, w := range serviceSignalWarnings(cfg, sm, sources) {
+		slog.Warn(w)
+	}
 	return sources
+}
+
+// newServiceMap builds the service ownership map from config, failing fast on a
+// rule that could never match anything useful.
+func newServiceMap(cfg config.CorrelationConfig) (*correlate.ServiceMap, error) {
+	entries := make([]correlate.ServiceMapEntry, 0, len(cfg.ServiceMap))
+	for _, e := range cfg.ServiceMap {
+		entries = append(entries, correlate.ServiceMapEntry{Match: e.Match, Services: e.Services})
+	}
+	paths := make([]correlate.PathPattern, 0, len(cfg.PathPatterns))
+	for _, p := range cfg.PathPatterns {
+		paths = append(paths, correlate.PathPattern{Pattern: p.Pattern, Service: p.Service})
+	}
+	sm, err := correlate.NewServiceMap(entries, paths)
+	if err != nil {
+		return nil, fmt.Errorf("correlation config: %w", err)
+	}
+	return sm, nil
+}
+
+// serviceSignalWarnings explains, for each enabled deploy source, when its
+// deploys cannot possibly match a spiking service. Without a service match the
+// best score is 0.625, under the 0.65 alert threshold, so such a source would
+// store candidates but never alert; better to say so at startup than to look
+// broken later.
+func serviceSignalWarnings(cfg config.SourcesConfig, sm *correlate.ServiceMap, enabled map[string]webhookSource) []string {
+	var out []string
+	if _, ok := enabled["github"]; ok && cfg.GitHub.Token == "" && !sm.HasRepoRules() {
+		out = append(out, "github: no sources.github.token and no correlation.service_map rule — GitHub deploys will carry "+
+			"no changed files and no service, so they cannot match a spiking service or reach the alert threshold; "+
+			"set a token or add a service_map rule")
+	}
+	if _, ok := enabled["gitlab"]; ok && cfg.GitLab.Token == "" && !sm.HasRepoRules() {
+		out = append(out, "gitlab: no sources.gitlab.token and no correlation.service_map rule — GitLab deploys will carry "+
+			"no changed files and no service, so they cannot match a spiking service or reach the alert threshold; "+
+			"set a read_api token or add a service_map rule")
+	}
+	if _, ok := enabled["argocd"]; ok && !sm.HasRepoRules() {
+		out = append(out, "argocd: sync events carry no changed files, so ArgoCD deploys can only match a service through "+
+			"correlation.service_map; add a rule matching your application name or repository, or they cannot reach the alert threshold")
+	}
+	return out
 }
 
 // resolveAPIToken returns the configured API token, or a freshly generated
@@ -432,8 +485,15 @@ func buildCostSource(ctx context.Context, cfg config.CostConfig) (collect.CostSo
 	switch cfg.Provider {
 	case "", "aws":
 		src, err := aws.NewCESource(ctx,
-			cfg.AWS.Region, cfg.AWS.Granularity,
-			cfg.LookbackDays, cfg.AnomalyMinDelta,
+			cfg.AWS.Region, cfg.AWS.Granularity, cfg.LookbackDays,
+			aws.Detector{
+				ZThreshold:    cfg.ZScoreThreshold,
+				MinDeltaPct:   cfg.AnomalyMinDelta,
+				MinHistory:    cfg.MinHistoryDays,
+				SameWeekday:   cfg.SameWeekdayBaseline,
+				SigmaFloorUSD: cfg.SigmaFloorUSD,
+			},
+			cfg.AWS.TagKeys,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("aws cost source: %w", err)
