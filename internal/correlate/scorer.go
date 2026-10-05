@@ -132,14 +132,25 @@ func (s *Scorer) serviceScore(anomaly models.CostSnapshot, deploy models.DeployE
 	var score float64
 	var reason string
 
+	// Compare canonical identities, not raw strings: Cost Explorer reports
+	// "Amazon Elastic Compute Cloud - Compute" where the service map says
+	// "AmazonEC2" (see CanonicalService).
+	target := CanonicalService(anomaly.Service)
 	for _, svc := range deploy.InferredServices {
-		if strings.EqualFold(svc, anomaly.Service) {
+		c := CanonicalService(svc)
+		if c == "" || target == "" {
+			continue
+		}
+		if c == target {
 			score = 1.0
-			reason = "exact service match: " + svc
+			reason = "exact service match: " + svc + " = " + anomaly.Service
 			break
 		}
-		// Fuzzy: "ecs" in a path matches "AmazonECS" service name.
-		if serviceContains(anomaly.Service, svc) && score < 0.70 {
+		// Partial: the anomaly's service name contains the inferred one
+		// ("Amazon Kinesis Firehose" ~ Kinesis). Names that merely start with
+		// another service's name are aliased to their own identity instead (see
+		// serviceAliases), so they cannot borrow its credit.
+		if len(c) >= minPartialLen && strings.Contains(target, c) && score < 0.70 {
 			score = 0.70
 			reason = "partial service match: " + svc + " ~ " + anomaly.Service
 		}

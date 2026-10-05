@@ -22,8 +22,8 @@ var defaultPatterns = []servicePattern{
 	{"terraform/sns", "AmazonSNS"},
 	{"terraform/eks", "AmazonEKS"},
 	{"terraform/ec2", "AmazonEC2"},
-	{"terraform/alb", "AmazonEC2"}, // ALB costs appear under EC2
-	{"terraform/nlb", "AmazonEC2"},
+	{"terraform/alb", "AmazonElasticLoadBalancing"}, // load balancers are their own Cost Explorer service
+	{"terraform/nlb", "AmazonElasticLoadBalancing"},
 	{"terraform/dynamodb", "AmazonDynamoDB"},
 	{"terraform/kinesis", "AmazonKinesis"},
 	{"terraform/opensearch", "AmazonOpenSearchService"},
@@ -64,10 +64,4 @@ func InferServicesFromFiles(files []string) []string {
 		}
 	}
 	return services
-}
-
-// serviceContains reports whether the AWS service name contains the short token
-// (case-insensitive). E.g. serviceContains("AmazonECS", "ecs") → true.
-func serviceContains(awsService, token string) bool {
-	return strings.Contains(strings.ToLower(awsService), strings.ToLower(token))
 }

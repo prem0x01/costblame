@@ -240,7 +240,11 @@ Every `(anomaly, deployment)` pair is scored by four independent factors. The we
 
 ### Service inference from file paths
 
-Changed files are mapped to billable cloud services using a pattern table. The mapping ships tuned for the built-in cost adapter's service names and lives in `internal/correlate/service_map.go` — extend it to match your infra layout and provider:
+Changed files are mapped to billable cloud services using a pattern table that lives in `internal/correlate/service_map.go` — extend it to match your infra layout and provider.
+
+**Service names are matched by identity, not spelling.** AWS Cost Explorer reports display names (`Amazon Elastic Compute Cloud - Compute`, `AWS Lambda`, `Amazon Simple Storage Service`, `EC2 - Other`), while people write product codes (`AmazonEC2`, `AWSLambda`) or short names (`ec2`, `lambda`, `s3`). All of these are recognised as the same service, ignoring case, spacing and punctuation, so a deploy that touches `terraform/lambda/` matches a spike on `AWS Lambda`. Services the table does not know still match when they differ only in case, spacing or punctuation, and a name contained in the spiking service's name (at least three characters) is a partial match.
+
+The default patterns:
 
 | File path pattern | Inferred service |
 |---|---|
