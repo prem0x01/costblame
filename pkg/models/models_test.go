@@ -46,7 +46,8 @@ func TestDeployEventID(t *testing.T) {
 func TestBlameEdgeID(t *testing.T) {
 	snap, deploy := uuid.New(), uuid.New()
 
-	if BlameEdgeID(snap, deploy) != BlameEdgeID(snap, deploy) {
+	first, again := BlameEdgeID(snap, deploy), BlameEdgeID(snap, deploy)
+	if first != again {
 		t.Error("edge ID is not deterministic for the same (snapshot, deploy) pair")
 	}
 	if BlameEdgeID(snap, deploy) == BlameEdgeID(snap, uuid.New()) {

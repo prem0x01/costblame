@@ -40,10 +40,10 @@ func (f *fakeGitLab) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Next-Page", strconv.Itoa(page+1))
 	}
 	if page > len(f.pages) {
-		json.NewEncoder(w).Encode([]any{})
+		_ = json.NewEncoder(w).Encode([]any{})
 		return
 	}
-	json.NewEncoder(w).Encode(f.pages[page-1])
+	_ = json.NewEncoder(w).Encode(f.pages[page-1])
 }
 
 func diff(newPath string) map[string]any {

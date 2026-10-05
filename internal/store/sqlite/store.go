@@ -89,7 +89,7 @@ func (s *Store) applyMigration(ctx context.Context, version, body string) error 
 	if err != nil {
 		return fmt.Errorf("applying migration %s: %w", version, err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }() // a no-op (sql.ErrTxDone) after a successful Commit
 
 	if _, err := tx.ExecContext(ctx, body); err != nil {
 		return fmt.Errorf("applying migration %s: %w", version, err)
@@ -115,7 +115,7 @@ func (s *Store) SaveCostSnapshots(ctx context.Context, snaps []models.CostSnapsh
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }() // a no-op (sql.ErrTxDone) after a successful Commit
 
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO cost_snapshots
@@ -317,7 +317,7 @@ func (s *Store) SaveBlameEdges(ctx context.Context, edges []models.BlameEdge) er
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }() // a no-op (sql.ErrTxDone) after a successful Commit
 
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO blame_edges

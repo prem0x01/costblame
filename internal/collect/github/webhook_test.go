@@ -389,10 +389,10 @@ func TestEnrichmentUnionsFilesWithTheRepoRule(t *testing.T) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]any{"number": 42, "title": "feat: cache", "user": map[string]any{"login": "alice"}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"number": 42, "title": "feat: cache", "user": map[string]any{"login": "alice"}})
 	})
 	mux.HandleFunc("/repos/Acme/Payments/pulls/42/files", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode([]map[string]any{{"filename": "terraform/s3/bucket.tf"}, {"filename": "docs/readme.md"}})
+		_ = json.NewEncoder(w).Encode([]map[string]any{{"filename": "terraform/s3/bucket.tf"}, {"filename": "docs/readme.md"}})
 	})
 	api := httptest.NewServer(mux)
 	defer api.Close()
