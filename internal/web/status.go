@@ -23,7 +23,9 @@ type SystemStatus struct {
 
 func (s SystemStatus) HasCostSource() bool   { return s.CostProvider != "" }
 func (s SystemStatus) HasDeploySource() bool { return len(s.DeploySources) > 0 }
-func (s SystemStatus) UsingLLM() bool        { return s.NarrativeEngine != "" && s.NarrativeEngine != "template" }
+func (s SystemStatus) UsingLLM() bool {
+	return s.NarrativeEngine != "" && s.NarrativeEngine != "template"
+}
 
 // Ready reports whether both halves of the correlation pipeline (a cost
 // source and at least one deploy source) are configured.

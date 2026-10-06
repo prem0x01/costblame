@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -170,6 +171,142 @@ func (s *Store) UnblamedAnomalies(ctx context.Context) ([]models.CostSnapshot, e
 	}
 	defer rows.Close()
 	return scanSnapshots(rows)
+}
+
+// Default and maximum page sizes for the list queries.
+const (
+	defaultListLimit = 100
+	maxListLimit     = 500
+)
+
+func clampLimit(n int) int {
+	switch {
+	case n <= 0:
+		return defaultListLimit
+	case n > maxListLimit:
+		return maxListLimit
+	}
+	return n
+}
+
+// placeholders returns "?,?,?" for n values.
+func placeholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+// anomalyStateQuery selects every anomaly with its edge counts and derived
+// state. The CASE mirrors models.StateOf (a test keeps them in agreement), but
+// lives in SQL so filtering by state and paging stay in the database instead
+// of loading every anomaly into memory.
+const anomalyStateQuery = `
+	SELECT id, collected_at, period_start, period_end, source, service, region, tags,
+	       amount_usd, prev_amount_usd, delta_usd, delta_pct, is_anomaly, anomaly_score, granularity,
+	       pending, resolved, confirmed, dismissed, top_score,
+	       CASE WHEN confirmed > 0 THEN 'confirmed'
+	            WHEN resolved  > 0 THEN 'resolved'
+	            WHEN pending   > 0 THEN 'candidates'
+	            WHEN dismissed > 0 THEN 'dismissed'
+	            ELSE 'unblamed' END AS state
+	FROM (
+		SELECT cs.id, cs.collected_at, cs.period_start, cs.period_end, cs.source, cs.service,
+		       cs.region, cs.tags, cs.amount_usd, cs.prev_amount_usd, cs.delta_usd, cs.delta_pct,
+		       cs.is_anomaly, cs.anomaly_score, cs.granularity,
+		       COALESCE(SUM(be.status = 'pending'), 0)   AS pending,
+		       COALESCE(SUM(be.status = 'resolved'), 0)  AS resolved,
+		       COALESCE(SUM(be.status = 'confirmed'), 0) AS confirmed,
+		       COALESCE(SUM(be.status = 'dismissed'), 0) AS dismissed,
+		       COALESCE(MAX(be.confidence_score), 0)     AS top_score
+		FROM cost_snapshots cs
+		LEFT JOIN blame_edges be ON be.cost_snapshot_id = cs.id
+		WHERE cs.is_anomaly = 1
+		GROUP BY cs.id
+	)`
+
+// ListAnomalies returns anomalies with their state and candidate counts,
+// newest first, optionally filtered by state. Unlike UnblamedAnomalies it also
+// returns anomalies that have candidates (most of them), so none vanish once
+// they have been scored.
+func (s *Store) ListAnomalies(ctx context.Context, f models.AnomalyFilter) ([]models.AnomalySummary, error) {
+	q := "SELECT * FROM (" + anomalyStateQuery + ")"
+	var args []any
+	if len(f.States) > 0 {
+		q += " WHERE state IN (" + placeholders(len(f.States)) + ")"
+		for _, st := range f.States {
+			args = append(args, string(st))
+		}
+	}
+	q += " ORDER BY period_start DESC, id LIMIT ? OFFSET ?"
+	args = append(args, clampLimit(f.Limit), max(f.Offset, 0))
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []models.AnomalySummary
+	for rows.Next() {
+		var a models.AnomalySummary
+		var id, gran, tagsJSON, state string
+		var isAnomaly int
+		if err := rows.Scan(&id, &a.CollectedAt, &a.PeriodStart, &a.PeriodEnd,
+			&a.Source, &a.Service, &a.Region, &tagsJSON,
+			&a.AmountUSD, &a.PrevAmountUSD, &a.DeltaUSD, &a.DeltaPct,
+			&isAnomaly, &a.AnomalyScore, &gran,
+			&a.Edges.Pending, &a.Edges.Resolved, &a.Edges.Confirmed, &a.Edges.Dismissed, &a.TopScore,
+			&state); err != nil {
+			return nil, err
+		}
+		a.ID, _ = uuid.Parse(id)
+		a.IsAnomaly = isAnomaly == 1
+		a.Granularity = models.Granularity(gran)
+		a.State = models.AnomalyState(state)
+		_ = json.Unmarshal([]byte(tagsJSON), &a.Tags)
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// AnomalyStateCounts returns how many anomalies are in each state, computed in
+// the database so the figures are exact however many there are.
+func (s *Store) AnomalyStateCounts(ctx context.Context) (map[models.AnomalyState]int, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT state, COUNT(*) FROM ("+anomalyStateQuery+") GROUP BY state")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[models.AnomalyState]int{}
+	for rows.Next() {
+		var st string
+		var n int
+		if err := rows.Scan(&st, &n); err != nil {
+			return nil, err
+		}
+		out[models.AnomalyState(st)] = n
+	}
+	return out, rows.Err()
+}
+
+// CostSnapshotByID returns one snapshot, or sql.ErrNoRows.
+func (s *Store) CostSnapshotByID(ctx context.Context, id uuid.UUID) (*models.CostSnapshot, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, collected_at, period_start, period_end,
+		       source, service, region, tags,
+		       amount_usd, prev_amount_usd, delta_usd, delta_pct,
+		       is_anomaly, anomaly_score, granularity
+		FROM cost_snapshots WHERE id = ?`, id.String())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	snaps, err := scanSnapshots(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(snaps) == 0 {
+		return nil, sql.ErrNoRows
+	}
+	return &snaps[0], nil
 }
 
 func (s *Store) UnscoredAnomalies(ctx context.Context) ([]models.CostSnapshot, error) {
@@ -428,6 +565,49 @@ func (s *Store) RecentBlameEdges(ctx context.Context, limit int) ([]models.Blame
 	}
 	defer rows.Close()
 	return scanBlameEdgesWithJoins(rows)
+}
+
+// ListBlameEdges returns edges newest first, optionally filtered by status. It
+// is what the UI and API use so that pending (medium-confidence) edges, the
+// common case, are reachable; RecentBlameEdges keeps its resolved/confirmed
+// meaning for the report command and the TUI.
+func (s *Store) ListBlameEdges(ctx context.Context, f models.BlameEdgeFilter) ([]models.BlameEdge, error) {
+	q := blameEdgeSelectJoined
+	var args []any
+	if len(f.Statuses) > 0 {
+		q += " WHERE be.status IN (" + placeholders(len(f.Statuses)) + ")"
+		for _, st := range f.Statuses {
+			args = append(args, string(st))
+		}
+	}
+	q += " ORDER BY be.created_at DESC, be.confidence_score DESC, be.id LIMIT ? OFFSET ?"
+	args = append(args, clampLimit(f.Limit), max(f.Offset, 0))
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanBlameEdgesWithJoins(rows)
+}
+
+// BlameStatusCounts returns the number of edges in each status.
+func (s *Store) BlameStatusCounts(ctx context.Context) (map[models.BlameStatus]int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM blame_edges GROUP BY status`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[models.BlameStatus]int{}
+	for rows.Next() {
+		var st string
+		var n int
+		if err := rows.Scan(&st, &n); err != nil {
+			return nil, err
+		}
+		out[models.BlameStatus(st)] = n
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) ConfirmedBlameCount(ctx context.Context, author, service string) (int, error) {

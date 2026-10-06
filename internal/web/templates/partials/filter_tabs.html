@@ -1,0 +1,6 @@
+{{define "filter_tabs.html"}}
+<nav class="tabs" aria-label="Filter">
+  {{range .}}<a class="tab{{if .Active}} tab-active{{end}}" href="{{.Href}}"{{if .Active}} aria-current="page"{{end}}>{{.Label}} <span class="tab-count">{{.Count}}</span></a>
+  {{end}}
+</nav>
+{{end}}

@@ -76,6 +76,23 @@ type Store interface {
 	// BlameEdgesBySnapshot returns all edges for a cost snapshot, sorted by ConfidenceScore desc.
 	BlameEdgesBySnapshot(ctx context.Context, snapshotID uuid.UUID) ([]models.BlameEdge, error)
 
+	// ListBlameEdges returns edges newest first, optionally filtered by status
+	// and paged. Unlike RecentBlameEdges it can include pending edges.
+	ListBlameEdges(ctx context.Context, f models.BlameEdgeFilter) ([]models.BlameEdge, error)
+
+	// BlameStatusCounts returns the number of edges in each status.
+	BlameStatusCounts(ctx context.Context) (map[models.BlameStatus]int, error)
+
+	// ListAnomalies returns anomalies with their state and candidate counts,
+	// optionally filtered by state and paged.
+	ListAnomalies(ctx context.Context, f models.AnomalyFilter) ([]models.AnomalySummary, error)
+
+	// AnomalyStateCounts returns the number of anomalies in each state.
+	AnomalyStateCounts(ctx context.Context) (map[models.AnomalyState]int, error)
+
+	// CostSnapshotByID returns one snapshot, or sql.ErrNoRows.
+	CostSnapshotByID(ctx context.Context, id uuid.UUID) (*models.CostSnapshot, error)
+
 	// RecentBlameEdges returns the most recent resolved blame edges, up to limit.
 	RecentBlameEdges(ctx context.Context, limit int) ([]models.BlameEdge, error)
 

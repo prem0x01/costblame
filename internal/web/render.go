@@ -21,6 +21,13 @@ var funcMap = template.FuncMap{
 	"signedPct": func(f float64) string { return fmt.Sprintf("%+.1f%%", f) },
 	"money":     func(f float64) string { return fmt.Sprintf("$%.2f", f) },
 	"sparkline": sparkline,
+	// shortSHA shortens a commit SHA for display.
+	"shortSHA": func(sha string) string {
+		if len(sha) > 7 {
+			return sha[:7]
+		}
+		return sha
+	},
 }
 
 // templateSet holds one combined (layout+partials+page) template per page,

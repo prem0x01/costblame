@@ -426,6 +426,22 @@ costblame report    # print the blame table to stdout
 
 ---
 
+## Web UI
+
+The server also serves a browser UI on the same port, behind the same token (see [Authentication](#authentication)):
+
+| Page | What it shows |
+|---|---|
+| **Dashboard** (`/`) | Exact counts of anomalies needing review, alerted edges awaiting review, unblamed anomalies and confirmed blames, each linking to the matching list, plus the latest activity. |
+| **Anomalies** (`/anomalies`) | Every flagged cost spike with its state, candidate count and best score; filter tabs (`?state=`) with counts. |
+| **Anomaly** (`/anomalies/{id}`) | One spike: its cost history and **every candidate deploy ranked by confidence, with Confirm and Dismiss on each**, including low-confidence pending ones. |
+| **Blame edges** (`/blame`) | Edges newest first; tabs (`?status=`) for Active (default, includes pending), Pending, Resolved, Confirmed, Dismissed and All. |
+| **Blame edge** (`/blame/{id}`) | One candidate: the narrative, the deploy, and each score factor with its weight. |
+
+Lists show the newest 50 rows and say how many match, so a truncated list is never mistaken for the whole story. The UI has no paging yet (tracked in #22); the API pages with `?limit=` and `?offset=`. After you Confirm or Dismiss a row, only that row updates: the state badge and counts elsewhere on the page refresh on reload.
+
+---
+
 ## CLI Reference
 
 | Command | What it does |
@@ -529,13 +545,27 @@ Explicit config (YAML or `COSTBLAME_*`) always wins over conventional fallbacks.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/blame` | List recent blame edges (resolved + confirmed) |
+| `GET` | `/api/blame` | List blame edges, newest first. `?status=` takes a comma-separated list of `pending`, `resolved`, `confirmed`, `dismissed`, `all`, or `active` (the default: everything except dismissed, **including pending**); `?limit=` (default 20, max 200) and `?offset=` page it |
 | `GET` | `/api/blame/:id` | Get a single blame edge by its edge ID |
 | `POST` | `/api/blame/:id/confirm` | Mark edge as confirmed (boosts historical scoring) |
 | `POST` | `/api/blame/:id/dismiss` | Mark edge as dismissed (false positive) |
-| `GET` | `/api/anomalies` | List unblamed cost anomalies |
+| `GET` | `/api/anomalies` | List every cost anomaly with its `state`, `edge_counts` and best `top_score`. `?state=` takes a comma-separated list of `candidates`, `resolved`, `unblamed`, `confirmed`, `dismissed`, or `all` (default); `?limit=` (default 50, max 200) and `?offset=` page it |
 | `GET` | `/api/anomalies/:id/blame` | List every candidate blame edge for one anomaly, best first |
 | `GET` | `/healthz` | Health check — returns `ok` (no auth) |
+
+### Anomaly states
+
+Each anomaly is in exactly one state, summarising its candidate blame edges (a confirmed edge outranks an alerted one, which outranks unreviewed candidates):
+
+| State | Meaning |
+|---|---|
+| `candidates` | Deploys were found but none was confident enough to alert (every edge is `pending`). These are the most common outcome and the ones worth a look. |
+| `resolved` | The top candidate scored above the alert threshold and an alert was sent. |
+| `confirmed` | A person confirmed one of the candidates. |
+| `dismissed` | Every candidate was dismissed as a false positive. |
+| `unblamed` | No deploy in the lookback window scored high enough to keep. |
+
+Unknown `status` or `state` values return `400` with the accepted values, and empty pages are `[]`, never `null`. Before this, an anomaly whose only edges were pending dropped out of `/api/anomalies` (which listed only anomalies with *no* edges) and out of `/api/blame` (resolved and confirmed only), so it could not be reviewed anywhere. `GET /api/anomalies` used to return only the unblamed ones; use `?state=unblamed` for that.
 
 ### Authentication
 

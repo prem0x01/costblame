@@ -52,6 +52,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /blame/{id}/confirm", h.ConfirmBlame)
 	mux.HandleFunc("POST /blame/{id}/dismiss", h.DismissBlame)
 	mux.HandleFunc("GET /anomalies", h.AnomalyList)
+	mux.HandleFunc("GET /anomalies/{id}", h.AnomalyDetail)
 
 	staticFS, err := staticFileSystem()
 	if err != nil {

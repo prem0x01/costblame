@@ -2,6 +2,7 @@ package models
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -154,6 +155,138 @@ type BlameEdge struct {
 	// Denormalized joins — populated by store on read, not persisted in columns.
 	CostSnapshot *CostSnapshot `db:"-" json:"cost_snapshot,omitempty"`
 	DeployEvent  *DeployEvent  `db:"-" json:"deploy_event,omitempty"`
+}
+
+// AllBlameStatuses lists every status a blame edge can have.
+var AllBlameStatuses = []BlameStatus{BlameStatusPending, BlameStatusResolved, BlameStatusConfirmed, BlameStatusDismissed}
+
+// ActiveBlameStatuses are the statuses that still deserve a person's attention:
+// everything except dismissed.
+var ActiveBlameStatuses = []BlameStatus{BlameStatusPending, BlameStatusResolved, BlameStatusConfirmed}
+
+// ParseBlameStatuses reads a comma-separated list of statuses, "all" for every
+// status, or "active" for everything except dismissed. It rejects unknown names
+// rather than silently ignoring them.
+func ParseBlameStatuses(csv string) ([]BlameStatus, error) {
+	switch strings.ToLower(strings.TrimSpace(csv)) {
+	case "all":
+		return append([]BlameStatus(nil), AllBlameStatuses...), nil
+	case "active":
+		return append([]BlameStatus(nil), ActiveBlameStatuses...), nil
+	}
+	var out []BlameStatus
+	for _, part := range strings.Split(csv, ",") {
+		part = strings.ToLower(strings.TrimSpace(part))
+		if part == "" {
+			continue
+		}
+		ok := false
+		for _, st := range AllBlameStatuses {
+			if string(st) == part {
+				out = append(out, st)
+				ok = true
+			}
+		}
+		if !ok {
+			return nil, fmt.Errorf("unknown status %q (want one of pending, resolved, confirmed, dismissed, active, or all)", part)
+		}
+	}
+	return out, nil
+}
+
+// AnomalyState says where a cost anomaly stands, summarising its candidate
+// blame edges. An anomaly with only low-confidence candidates is "candidates",
+// not invisible: that is the common case and it needs a human to look.
+type AnomalyState string
+
+const (
+	AnomalyStateUnblamed   AnomalyState = "unblamed"   // no candidate deploy was found
+	AnomalyStateCandidates AnomalyState = "candidates" // candidates stored, none alerted or confirmed yet
+	AnomalyStateResolved   AnomalyState = "resolved"   // an alert was sent for the top candidate
+	AnomalyStateConfirmed  AnomalyState = "confirmed"  // a person confirmed a candidate
+	AnomalyStateDismissed  AnomalyState = "dismissed"  // every candidate was dismissed
+)
+
+// AllAnomalyStates lists every anomaly state, in the order a reader triages them.
+var AllAnomalyStates = []AnomalyState{
+	AnomalyStateCandidates, AnomalyStateResolved, AnomalyStateUnblamed, AnomalyStateConfirmed, AnomalyStateDismissed,
+}
+
+// ParseAnomalyStates reads a comma-separated list of anomaly states, or "all".
+func ParseAnomalyStates(csv string) ([]AnomalyState, error) {
+	if strings.EqualFold(strings.TrimSpace(csv), "all") {
+		return append([]AnomalyState(nil), AllAnomalyStates...), nil
+	}
+	var out []AnomalyState
+	for _, part := range strings.Split(csv, ",") {
+		part = strings.ToLower(strings.TrimSpace(part))
+		if part == "" {
+			continue
+		}
+		ok := false
+		for _, st := range AllAnomalyStates {
+			if string(st) == part {
+				out = append(out, st)
+				ok = true
+			}
+		}
+		if !ok {
+			return nil, fmt.Errorf("unknown state %q (want one of candidates, resolved, unblamed, confirmed, dismissed, or all)", part)
+		}
+	}
+	return out, nil
+}
+
+// EdgeCounts is the number of an anomaly's candidate edges in each status.
+type EdgeCounts struct {
+	Pending   int `json:"pending"`
+	Resolved  int `json:"resolved"`
+	Confirmed int `json:"confirmed"`
+	Dismissed int `json:"dismissed"`
+}
+
+// Total is the number of candidate edges.
+func (c EdgeCounts) Total() int { return c.Pending + c.Resolved + c.Confirmed + c.Dismissed }
+
+// StateOf derives an anomaly's state from its edge counts: a confirmed edge
+// outranks an alerted one, which outranks unreviewed candidates, which outrank
+// an anomaly whose every candidate was dismissed.
+func StateOf(c EdgeCounts) AnomalyState {
+	switch {
+	case c.Confirmed > 0:
+		return AnomalyStateConfirmed
+	case c.Resolved > 0:
+		return AnomalyStateResolved
+	case c.Pending > 0:
+		return AnomalyStateCandidates
+	case c.Dismissed > 0:
+		return AnomalyStateDismissed
+	}
+	return AnomalyStateUnblamed
+}
+
+// AnomalySummary is a cost anomaly with where it stands. CostSnapshot is
+// embedded so its fields stay at the top level of the JSON, as they were when
+// the API returned bare snapshots.
+type AnomalySummary struct {
+	CostSnapshot
+	State    AnomalyState `json:"state"`
+	Edges    EdgeCounts   `json:"edge_counts"`
+	TopScore float64      `json:"top_score"` // best candidate's confidence, 0 when there is none
+}
+
+// BlameEdgeFilter selects blame edges. Empty Statuses means all statuses.
+type BlameEdgeFilter struct {
+	Statuses []BlameStatus
+	Limit    int // 0 = the store's default
+	Offset   int
+}
+
+// AnomalyFilter selects anomalies. Empty States means all states.
+type AnomalyFilter struct {
+	States []AnomalyState
+	Limit  int // 0 = the store's default
+	Offset int
 }
 
 // BlameGraph is the complete causal chain for a single cost anomaly.

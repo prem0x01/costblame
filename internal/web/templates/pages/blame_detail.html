@@ -4,6 +4,7 @@
 
 <div class="detail-section">
   {{template "status_badge.html" $e}}
+  <p><a class="plain" href="/anomalies/{{$e.CostSnapshotID}}">See every candidate for this anomaly &rarr;</a></p>
 </div>
 
 {{if $e.Narrative}}
@@ -28,7 +29,7 @@
 
 {{if $e.DeployEvent}}
 <div class="detail-section">
-  <h2>Most likely deployment</h2>
+  <h2>{{if eq $e.Status "pending"}}Candidate deployment{{else}}Most likely deployment{{end}}</h2>
   <p>
     PR #{{$e.DeployEvent.PRNumber}} &mdash; &ldquo;{{$e.DeployEvent.PRTitle}}&rdquo; by @{{$e.DeployEvent.PRAuthor}}<br>
     <span class="muted">Deployed {{$e.DeployEvent.OccurredAt.Format "Jan 2 15:04 UTC"}} to {{$e.DeployEvent.Repository}} ({{$e.DeployEvent.Branch}})</span>
@@ -42,10 +43,10 @@
   <div class="factor-row">
     <div class="factor-head">
       <span class="factor-name">{{.Name}}</span>
-      <span class="factor-score">{{pct .Score}}</span>
+      <span class="factor-score">{{if .Weight}}{{pct .Score}}{{else}}skipped{{end}}</span>
     </div>
     <div class="factor-bar"><div class="factor-bar-fill" style="width: {{pct .Score}}"></div></div>
-    <span class="factor-reason">{{.Reason}}</span>
+    <span class="factor-reason">{{if .Weight}}weight {{pct .Weight}} &middot; {{end}}{{.Reason}}</span>
   </div>
   {{end}}
 </div>
