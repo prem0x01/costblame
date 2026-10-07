@@ -1,0 +1,140 @@
+name: Release
+
+# Pushing a tag like v0.2.0 builds binaries for each platform on a runner of that
+# platform, publishes them with checksums as a GitHub Release, and pushes a
+# multi-arch container image.
+#
+# Why not goreleaser: SQLite is linked through CGO (go-sqlite3), and
+# cross-compiling CGO for macOS and arm64 from one Linux runner needs a cross
+# toolchain per target. Building natively on each platform avoids that.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+      - run: CGO_ENABLED=1 go test -race -timeout 120s ./...
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,  goarch: amd64, runner: ubuntu-latest }
+          - { goos: linux,  goarch: arm64, runner: ubuntu-24.04-arm }
+          - { goos: darwin, goarch: arm64, runner: macos-14 }
+          # Intel macs: built on the arm runner. Apple's clang compiles C for
+          # x86_64 natively, so CGO cross-compiles without extra toolchains.
+          - { goos: darwin, goarch: amd64, runner: macos-14 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          if [ "${{ matrix.goos }}-${{ matrix.goarch }}" = "darwin-amd64" ]; then
+            export CC="clang -arch x86_64"
+          fi
+          PKG=github.com/prem0x01/costblame/internal/version
+          go build -trimpath -ldflags "-s -w \
+            -X $PKG.Version=${GITHUB_REF_NAME} \
+            -X $PKG.Commit=${GITHUB_SHA::12} \
+            -X $PKG.Date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o costblame ./cmd/costblame
+
+      - name: Smoke test (native builds only)
+        if: matrix.goos != 'darwin' || matrix.goarch == 'arm64'
+        run: ./costblame version
+
+      - name: Package
+        run: |
+          NAME=costblame_${GITHUB_REF_NAME}_${{ matrix.goos }}_${{ matrix.goarch }}
+          mkdir "$NAME"
+          cp costblame costblame.example.yaml LICENSE README.md "$NAME"/
+          tar czf "$NAME.tar.gz" "$NAME"
+          echo "ARCHIVE=$NAME.tar.gz" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          merge-multiple: true
+      - name: Checksums
+        run: sha256sum costblame_*.tar.gz > checksums.txt && cat checksums.txt
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PRE=""
+          case "$GITHUB_REF_NAME" in *-*) PRE="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" costblame_*.tar.gz checksums.txt \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes $PRE
+
+  image:
+    name: Container image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}

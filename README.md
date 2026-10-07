@@ -409,6 +409,21 @@ docker compose --profile dev up
 
 The init container runs `costblame migrate` to apply the schema, exits 0, and then the main container starts. If migration fails, the main service never starts.
 
+### Install a release
+
+Tagged releases publish binaries and a container image:
+
+```bash
+# Binary: linux and macOS, amd64 and arm64. Verify against checksums.txt from the same release.
+curl -LO https://github.com/prem0x01/costblame/releases/latest/download/costblame_<version>_linux_amd64.tar.gz
+tar xzf costblame_<version>_linux_amd64.tar.gz && ./costblame_<version>_linux_amd64/costblame version
+
+# Container (linux/amd64 and linux/arm64)
+docker run --rm ghcr.io/prem0x01/costblame:latest version
+```
+
+`costblame version` prints the version, commit and platform. Releases are built by `.github/workflows/release.yml` when a `v*` tag is pushed (a tag with a suffix such as `v0.2.0-rc1` is marked as a pre-release and does not move the `latest` image tag). Each platform is built on a runner of that platform, because SQLite is linked through CGO.
+
 ### Run locally
 
 ```bash

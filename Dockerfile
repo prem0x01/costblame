@@ -9,7 +9,15 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o /bin/costblame ./cmd/costblame
+ARG VERSION=dev
+ARG COMMIT=
+ARG DATE=
+RUN CGO_ENABLED=1 GOOS=linux go build -trimpath \
+      -ldflags="-s -w \
+        -X github.com/prem0x01/costblame/internal/version.Version=${VERSION} \
+        -X github.com/prem0x01/costblame/internal/version.Commit=${COMMIT} \
+        -X github.com/prem0x01/costblame/internal/version.Date=${DATE}" \
+      -o /bin/costblame ./cmd/costblame
 
 # Runtime stage — minimal Alpine image
 FROM alpine:3.20
