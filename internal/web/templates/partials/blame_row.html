@@ -1,20 +1,20 @@
 {{define "blame_row.html"}}
 <tr id="blame-row-{{.ID}}">
-  <td>{{if .CostSnapshot}}{{.CostSnapshot.Service}}{{else}}(unknown){{end}}</td>
+  <td>{{if .CostSnapshot}}<a class="plain" href="/anomalies/{{.CostSnapshotID}}">{{.CostSnapshot.Service}}</a>{{else}}(unknown){{end}}</td>
   <td>{{if .CostSnapshot}}{{signedPct .CostSnapshot.DeltaPct}}{{end}}</td>
-  <td>{{pct .ConfidenceScore}}</td>
+  <td class="score">{{pct .ConfidenceScore}}</td>
   <td>
     {{if .DeployEvent}}
-      <a class="plain" href="/blame/{{.ID}}">#{{.DeployEvent.PRNumber}}</a>
+      <a class="plain" href="/blame/{{.ID}}">{{if .DeployEvent.PRNumber}}#{{.DeployEvent.PRNumber}}{{else}}{{shortSHA .DeployEvent.CommitSHA}}{{end}}</a>
     {{else}}
       <a class="plain" href="/blame/{{.ID}}">view</a>
     {{end}}
   </td>
-  <td>{{if .DeployEvent}}@{{.DeployEvent.PRAuthor}}{{end}}</td>
+  <td>{{if .DeployEvent}}{{if .DeployEvent.PRAuthor}}@{{.DeployEvent.PRAuthor}}{{else}}<span class="muted">unknown</span>{{end}}{{end}}</td>
   <td><span class="badge badge-{{.Status}}">{{.Status}}</span></td>
   <td class="muted">{{if .DeployEvent}}{{.DeployEvent.OccurredAt.Format "Jan 2 15:04"}}{{end}}</td>
   <td class="actions">
-    {{if eq .Status "resolved"}}
+    {{if or (eq .Status "pending") (eq .Status "resolved")}}
       <button class="btn btn-confirm" hx-post="/blame/{{.ID}}/confirm" hx-vals='{"view":"row"}' hx-target="closest tr" hx-swap="outerHTML swap:120ms settle:250ms">Confirm</button>
       <button class="btn btn-dismiss" hx-post="/blame/{{.ID}}/dismiss" hx-vals='{"view":"row"}' hx-target="closest tr" hx-swap="outerHTML swap:120ms settle:250ms">Dismiss</button>
     {{end}}

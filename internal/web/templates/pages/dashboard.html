@@ -9,18 +9,22 @@
   </div>
 
   <div class="cards">
-    <div class="card">
-      <div class="value" data-countup="{{.UnblamedCount}}">0</div>
+    <a class="card card-link" href="/anomalies?state=candidates">
+      <div class="value" data-countup="{{.Candidates}}">0</div>
+      <div class="label">Candidates to review</div>
+    </a>
+    <a class="card card-link" href="/blame?status=resolved">
+      <div class="value" data-countup="{{.Resolved}}">0</div>
+      <div class="label">Alerted, awaiting review</div>
+    </a>
+    <a class="card card-link" href="/anomalies?state=unblamed">
+      <div class="value" data-countup="{{.Unblamed}}">0</div>
       <div class="label">Unblamed anomalies</div>
-    </div>
-    <div class="card">
-      <div class="value" data-countup="{{.AwaitingReview}}">0</div>
-      <div class="label">Awaiting review</div>
-    </div>
-    <div class="card">
-      <div class="value" data-countup="{{.ConfirmedCount}}">0</div>
+    </a>
+    <a class="card card-link" href="/blame?status=confirmed">
+      <div class="value" data-countup="{{.Confirmed}}">0</div>
       <div class="label">Confirmed</div>
-    </div>
+    </a>
     <div class="card card-live">
       <div class="live-dot"></div>
       <div class="label">Live &middot; refreshing every 15s</div>
@@ -42,7 +46,7 @@
       {{range .Recent}}{{template "blame_row.html" .}}{{end}}
     </tbody>
   </table>
-  <p><a class="plain" href="/blame">View all blame edges &rarr;</a></p>
+  <p><a class="plain" href="/blame">View all blame edges &rarr;</a> &middot; <a class="plain" href="/anomalies">View all anomalies &rarr;</a></p>
   {{end}}
 </div>
 {{end}}

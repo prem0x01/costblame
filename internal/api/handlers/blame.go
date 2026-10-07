@@ -17,11 +17,14 @@ import (
 
 // BlameStore is the subset of store.Store required by the blame handlers.
 type BlameStore interface {
-	RecentBlameEdges(ctx context.Context, limit int) ([]models.BlameEdge, error)
+	ListBlameEdges(ctx context.Context, f models.BlameEdgeFilter) ([]models.BlameEdge, error)
+	BlameStatusCounts(ctx context.Context) (map[models.BlameStatus]int, error)
 	BlameEdgeByID(ctx context.Context, id uuid.UUID) (*models.BlameEdge, error)
 	BlameEdgesBySnapshot(ctx context.Context, snapshotID uuid.UUID) ([]models.BlameEdge, error)
 	UpdateBlameStatus(ctx context.Context, id uuid.UUID, status models.BlameStatus) error
-	UnblamedAnomalies(ctx context.Context) ([]models.CostSnapshot, error)
+	ListAnomalies(ctx context.Context, f models.AnomalyFilter) ([]models.AnomalySummary, error)
+	AnomalyStateCounts(ctx context.Context) (map[models.AnomalyState]int, error)
+	CostSnapshotByID(ctx context.Context, id uuid.UUID) (*models.CostSnapshot, error)
 	CostSnapshotsByService(ctx context.Context, service string, from, to time.Time) ([]models.CostSnapshot, error)
 }
 
@@ -35,26 +38,57 @@ func NewBlameHandler(store BlameStore) *BlameHandler {
 	return &BlameHandler{store: store}
 }
 
-// ListBlame handles GET /blame
-// Query params: limit (default 20)
+// ListBlame handles GET /api/blame.
+//
+// Query params:
+//   - status: comma-separated statuses (pending, resolved, confirmed, dismissed)
+//     or "all". Default: pending, resolved and confirmed. Pending edges are the
+//     medium-confidence candidates most anomalies end up with, so they are
+//     included by default; dismissed ones are hidden unless asked for.
+//   - limit: page size (default 20, at most 200); offset: rows to skip.
 func (h *BlameHandler) ListBlame(w http.ResponseWriter, r *http.Request) {
-	limit := 20
-	if l := r.URL.Query().Get("limit"); l != "" {
-		if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 200 {
-			limit = n
+	q := r.URL.Query()
+
+	statuses := models.ActiveBlameStatuses
+	if raw := q.Get("status"); raw != "" {
+		parsed, err := models.ParseBlameStatuses(raw)
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(parsed) > 0 {
+			statuses = parsed
 		}
 	}
+	limit, offset := pageParams(q.Get("limit"), q.Get("offset"), 20)
 
-	edges, err := h.store.RecentBlameEdges(r.Context(), limit)
+	edges, err := h.store.ListBlameEdges(r.Context(), models.BlameEdgeFilter{Statuses: statuses, Limit: limit, Offset: offset})
 	if err != nil {
 		jsonError(w, "fetching blame edges", http.StatusInternalServerError)
 		return
 	}
 
+	if edges == nil {
+		edges = []models.BlameEdge{} // an empty page is [], not null
+	}
 	jsonOK(w, map[string]any{
 		"blame_edges": edges,
 		"count":       len(edges),
+		"statuses":    statuses,
 	})
+}
+
+// pageParams reads limit and offset query values, falling back to the given
+// default limit (limit must be 1..200) and a zero offset.
+func pageParams(limitRaw, offsetRaw string, defaultLimit int) (limit, offset int) {
+	limit = defaultLimit
+	if n, err := strconv.Atoi(limitRaw); err == nil && n > 0 && n <= 200 {
+		limit = n
+	}
+	if n, err := strconv.Atoi(offsetRaw); err == nil && n > 0 {
+		offset = n
+	}
+	return limit, offset
 }
 
 // GetBlame handles GET /blame/{id} — {id} is a blame edge ID, the same ID
@@ -126,12 +160,35 @@ func (h *BlameHandler) updateStatus(w http.ResponseWriter, r *http.Request, stat
 	jsonOK(w, map[string]any{"id": id, "status": status})
 }
 
-// ListAnomalies handles GET /anomalies
+// ListAnomalies handles GET /api/anomalies.
+//
+// Every anomaly is returned with its state (unblamed, candidates, resolved,
+// confirmed or dismissed), its candidate counts and its best score. An anomaly
+// whose only edges are low-confidence candidates is "candidates", not hidden.
+//
+// Query params: state (comma-separated, or "all"; default all), limit (default
+// 50, at most 200) and offset.
 func (h *BlameHandler) ListAnomalies(w http.ResponseWriter, r *http.Request) {
-	anomalies, err := h.store.UnblamedAnomalies(r.Context())
+	q := r.URL.Query()
+
+	var states []models.AnomalyState
+	if raw := q.Get("state"); raw != "" {
+		parsed, err := models.ParseAnomalyStates(raw)
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		states = parsed
+	}
+	limit, offset := pageParams(q.Get("limit"), q.Get("offset"), 50)
+
+	anomalies, err := h.store.ListAnomalies(r.Context(), models.AnomalyFilter{States: states, Limit: limit, Offset: offset})
 	if err != nil {
 		jsonError(w, "fetching anomalies", http.StatusInternalServerError)
 		return
+	}
+	if anomalies == nil {
+		anomalies = []models.AnomalySummary{}
 	}
 	jsonOK(w, map[string]any{"anomalies": anomalies, "count": len(anomalies)})
 }

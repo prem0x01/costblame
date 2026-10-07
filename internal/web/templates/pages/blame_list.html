@@ -1,26 +1,34 @@
 {{define "content"}}
 <div class="page-head">
   <h1>Blame edges</h1>
-  <p class="page-subtitle">Every cost anomaly costblame has matched to a candidate deploy, ranked by confidence. Confirm the ones that are right, dismiss the ones that aren't — that feedback improves future scoring.</p>
+  <p class="page-subtitle">Every cost anomaly costblame has matched to a candidate deploy, newest first. <strong>Pending</strong> candidates scored below the alert threshold but may still be right; <strong>resolved</strong> ones triggered an alert. Confirm the ones that are right, dismiss the ones that aren't — that feedback improves future scoring.</p>
 </div>
+
+{{template "filter_tabs.html" .Tabs}}
 
 {{if not .Edges}}
   <div class="empty-state">
-    <p>No blame edges yet.</p>
-    {{if not .Status.Ready}}
-      <p class="muted">This is expected — costblame needs both a cost source and a deploy source connected before it can correlate anything. <a class="plain" href="/">See what's left to set up &rarr;</a></p>
+    {{if eq .Selected "active"}}
+      <p>No blame edges yet.</p>
+      {{if not .Status.Ready}}
+        <p class="muted">This is expected — costblame needs both a cost source and a deploy source connected before it can correlate anything. <a class="plain" href="/">See what's left to set up &rarr;</a></p>
+      {{else}}
+        <p class="muted">Nothing to correlate right now. As soon as a cost anomaly and a nearby deploy are both recorded, a scored blame edge shows up here — usually within a minute.</p>
+      {{end}}
     {{else}}
-      <p class="muted">Nothing to correlate right now. As soon as a cost anomaly and a nearby deploy are both recorded, a scored blame edge shows up here — usually within a minute.</p>
+      <p>No {{.Selected}} blame edges.</p>
+      <p class="muted"><a class="plain" href="/blame?status=active">Show active blame edges &rarr;</a></p>
     {{end}}
   </div>
 {{else}}
 <table>
   <thead>
-    <tr><th>Service</th><th>Delta</th><th>Score</th><th>PR</th><th>Author</th><th>Status</th><th>When</th><th></th></tr>
+    <tr><th>Service</th><th>Delta</th><th>Score</th><th>PR</th><th>Author</th><th>Status</th><th>Deployed</th><th></th></tr>
   </thead>
   <tbody>
     {{range .Edges}}{{template "blame_row.html" .}}{{end}}
   </tbody>
 </table>
+{{if gt .Matching (len .Edges)}}<p class="muted">Showing the newest {{len .Edges}} of {{.Matching}}.</p>{{end}}
 {{end}}
 {{end}}

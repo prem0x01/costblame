@@ -1,33 +1,47 @@
 {{define "content"}}
 <div class="page-head">
-  <h1>Unblamed anomalies</h1>
-  <p class="page-subtitle">Cost snapshots flagged as statistically abnormal that don't have a blame edge yet — either just detected, or no deploy candidate was found in the lookback window.</p>
+  <h1>Anomalies</h1>
+  <p class="page-subtitle">Every cost spike costblame has flagged, and where it stands.
+    <strong>Candidates</strong>: deploys were found but none was confident enough to alert — worth a look.
+    <strong>Resolved</strong>: the top candidate was alerted.
+    <strong>Unblamed</strong>: no deploy was found in the lookback window.</p>
 </div>
+
+{{template "filter_tabs.html" .Tabs}}
 
 {{if not .Anomalies}}
   <div class="empty-state">
-    <p>No unblamed anomalies.</p>
-    {{if not .Status.HasCostSource}}
-      <p class="muted">costblame has no cost source connected yet, so nothing is being scanned for spikes. <a class="plain" href="/">Connect one from the dashboard &rarr;</a></p>
+    {{if eq .Selected "all"}}
+      <p>No cost anomalies yet.</p>
+      {{if not .Status.HasCostSource}}
+        <p class="muted">costblame has no cost source connected yet, so nothing is being scanned for spikes. <a class="plain" href="/">Connect one from the dashboard &rarr;</a></p>
+      {{else}}
+        <p class="muted">Nothing unusual has happened so far. Spikes show up here as soon as one is detected.</p>
+      {{end}}
     {{else}}
-      <p class="muted">Either nothing unusual has happened, or every anomaly so far has already been matched to a deploy — check the <a class="plain" href="/blame">blame edges</a> page.</p>
+      <p>No anomalies are {{.Selected}}.</p>
+      <p class="muted"><a class="plain" href="/anomalies?state=all">Show all anomalies &rarr;</a></p>
     {{end}}
   </div>
 {{else}}
 <table>
   <thead>
-    <tr><th>Service</th><th>Amount</th><th>Delta</th><th>Period</th></tr>
+    <tr><th>Service</th><th>Amount</th><th>Delta</th><th>Period</th><th>State</th><th>Candidates</th><th>Best</th></tr>
   </thead>
   <tbody>
     {{range .Anomalies}}
     <tr class="row-enter">
-      <td>{{.Service}}</td>
+      <td><a class="plain" href="/anomalies/{{.ID}}">{{.Service}}</a></td>
       <td>{{money .AmountUSD}} <span class="muted">(was {{money .PrevAmountUSD}})</span></td>
       <td>{{signedPct .DeltaPct}}</td>
       <td>{{.PeriodStart.Format "Jan 2 15:04 UTC"}}</td>
+      <td>{{template "state_badge.html" .State}}</td>
+      <td>{{if .Edges.Total}}{{.Edges.Total}}{{if .Edges.Pending}} <span class="muted">({{.Edges.Pending}} pending)</span>{{end}}{{else}}<span class="muted">none</span>{{end}}</td>
+      <td class="score">{{if .Edges.Total}}{{pct .TopScore}}{{else}}<span class="muted">&mdash;</span>{{end}}</td>
     </tr>
     {{end}}
   </tbody>
 </table>
+{{if gt .Matching (len .Anomalies)}}<p class="muted">Showing the newest {{len .Anomalies}} of {{.Matching}}.</p>{{end}}
 {{end}}
 {{end}}

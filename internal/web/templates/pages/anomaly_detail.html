@@ -1,0 +1,37 @@
+{{define "content"}}
+<div class="page-head">
+  <h1>{{.Anomaly.Service}} cost spike</h1>
+  <p class="page-subtitle">
+    {{money .Anomaly.AmountUSD}} (was {{money .Anomaly.PrevAmountUSD}}, {{signedPct .Anomaly.DeltaPct}}) &middot;
+    period starting {{.Anomaly.PeriodStart.Format "Jan 2 15:04 UTC"}} &middot;
+    {{template "state_badge.html" .State}}
+  </p>
+</div>
+
+<div class="detail-section">
+  <div class="chart-wrap">
+    <h2 class="chart-title">{{.Anomaly.Service}} &middot; last {{len .History}} periods</h2>
+    {{sparkline .History}}
+  </div>
+</div>
+
+<div class="detail-section">
+  <h2>Candidate deploys</h2>
+  {{if not .Edges}}
+    <div class="empty-state">
+      <p>No candidate deploys.</p>
+      <p class="muted">No deploy in the lookback window scored high enough to keep. Either nothing was deployed, deploy events weren't received (check <a class="plain" href="/setup">Setup</a>), or none looked related to this service — a deploy needs a service match to rank well.</p>
+    </div>
+  {{else}}
+    <p class="muted">Ranked by confidence. {{if .Counts.Pending}}{{.Counts.Pending}} still need a decision. {{end}}Confirm the deploy that really caused this and dismiss the ones that didn't — your verdicts sharpen future scoring.</p>
+    <table>
+      <thead>
+        <tr><th>Service</th><th>Delta</th><th>Score</th><th>PR</th><th>Author</th><th>Status</th><th>Deployed</th><th></th></tr>
+      </thead>
+      <tbody>
+        {{range .Edges}}{{template "blame_row.html" .}}{{end}}
+      </tbody>
+    </table>
+  {{end}}
+</div>
+{{end}}

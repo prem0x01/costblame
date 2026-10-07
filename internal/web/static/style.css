@@ -343,3 +343,24 @@ a.plain:hover { opacity: 0.75; }
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
 }
+
+/* ---------- filter tabs, clickable cards, anomaly state badges ---------- */
+.tabs { display: flex; gap: 0.4rem; flex-wrap: wrap; margin: 0 0 1.25rem; }
+.tab {
+  display: inline-flex; align-items: center; gap: 0.45rem;
+  padding: 0.35rem 0.8rem; border: 1px solid var(--border); border-radius: 999px;
+  font-size: 0.82rem; color: var(--muted); text-decoration: none; background: transparent;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+.tab:hover { color: var(--fg); border-color: var(--fg); }
+.tab-active { background: var(--ink); color: var(--ink-fg); border-color: var(--ink); font-weight: 600; }
+.tab-active:hover { color: var(--ink-fg); }
+.tab-count { font-variant-numeric: tabular-nums; font-size: 0.75rem; opacity: 0.7; }
+a.card-link { display: block; color: inherit; text-decoration: none; }
+.score { font-variant-numeric: tabular-nums; }
+/* same language as the edge status badges: value by weight and outline, not hue */
+.badge-state-candidates { background: transparent; color: var(--fg); border-color: var(--fg); }
+.badge-state-unblamed { background: transparent; color: var(--muted); border-color: var(--border); border-style: dashed; }
+.badge-state-resolved { background: var(--ink); color: var(--ink-fg); }
+.badge-state-confirmed { background: var(--surface); color: var(--fg); border-color: var(--border); }
+.badge-state-dismissed { background: transparent; color: var(--muted); opacity: 0.7; }

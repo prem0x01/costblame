@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,14 +18,31 @@ import (
 // query on every page view.
 const costHistoryLookback = 14 * 24 * time.Hour
 
-// dashboardData backs templates/pages/dashboard.html. Every count here is
-// derived from real store queries — none of it is placeholder data.
+// Page sizes. The lists are capped, not paged, for now: the page says how many
+// rows match so a truncated list is never mistaken for the whole story.
+const (
+	blameListLimit   = 50
+	anomalyListLimit = 50
+	dashboardRecent  = 5
+)
+
+// tab is one choice in a filter bar. Count is the number of rows behind it.
+type tab struct {
+	Label  string
+	Href   string
+	Count  int
+	Active bool
+}
+
+// dashboardData backs templates/pages/dashboard.html. Every figure is an exact
+// COUNT from the store, not derived from a truncated list.
 type dashboardData struct {
 	pageBase
-	UnblamedCount  int
-	AwaitingReview int
-	ConfirmedCount int
-	Recent         []models.BlameEdge
+	Unblamed   int // anomalies with no candidate deploy
+	Candidates int // anomalies with candidates nobody has acted on: need a look
+	Resolved   int // edges that triggered an alert and await review
+	Confirmed  int
+	Recent     []models.BlameEdge
 }
 
 // Dashboard handles GET /. Until both a cost source and a deploy source are
@@ -36,58 +54,88 @@ func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	anomalies, err := h.store.UnblamedAnomalies(r.Context())
+	anomalyCounts, err := h.store.AnomalyStateCounts(r.Context())
 	if err != nil {
-		http.Error(w, "fetching anomalies", http.StatusInternalServerError)
+		http.Error(w, "counting anomalies", http.StatusInternalServerError)
 		return
 	}
-
-	// Fetch a larger window than we display so the stat cards reflect real
-	// totals, not just the 5 rows shown in the table below them.
-	edges, err := h.store.RecentBlameEdges(r.Context(), 100)
+	edgeCounts, err := h.store.BlameStatusCounts(r.Context())
+	if err != nil {
+		http.Error(w, "counting blame edges", http.StatusInternalServerError)
+		return
+	}
+	recent, err := h.store.ListBlameEdges(r.Context(), models.BlameEdgeFilter{Statuses: models.ActiveBlameStatuses, Limit: dashboardRecent})
 	if err != nil {
 		http.Error(w, "fetching blame edges", http.StatusInternalServerError)
 		return
 	}
 
-	var awaitingReview, confirmed int
-	for _, e := range edges {
-		switch e.Status {
-		case models.BlameStatusResolved:
-			awaitingReview++
-		case models.BlameStatusConfirmed:
-			confirmed++
-		}
-	}
-
-	recent := edges
-	if len(recent) > 5 {
-		recent = recent[:5]
-	}
-
 	h.templates.renderPage(w, "dashboard.html", dashboardData{
-		pageBase:       h.base("dashboard"),
-		UnblamedCount:  len(anomalies),
-		AwaitingReview: awaitingReview,
-		ConfirmedCount: confirmed,
-		Recent:         recent,
+		pageBase:   h.base("dashboard"),
+		Unblamed:   anomalyCounts[models.AnomalyStateUnblamed],
+		Candidates: anomalyCounts[models.AnomalyStateCandidates],
+		Resolved:   edgeCounts[models.BlameStatusResolved],
+		Confirmed:  edgeCounts[models.BlameStatusConfirmed],
+		Recent:     recent,
 	})
 }
 
 // blameListData backs templates/pages/blame_list.html.
 type blameListData struct {
 	pageBase
-	Edges []models.BlameEdge
+	Edges    []models.BlameEdge
+	Tabs     []tab
+	Selected string // the active tab's value
+	Matching int    // edges matching the filter, of which Edges shows the newest
 }
 
-// BlameList handles GET /blame.
+// blameTabs lists the status filters. "active" (the default) is everything
+// except dismissed, and deliberately includes pending: those candidates are what
+// most anomalies end up with and they are the ones needing a human.
+var blameTabs = []struct{ Value, Label string }{
+	{"active", "Active"}, {"pending", "Pending"}, {"resolved", "Resolved"},
+	{"confirmed", "Confirmed"}, {"dismissed", "Dismissed"}, {"all", "All"},
+}
+
+func countStatuses(counts map[models.BlameStatus]int, statuses []models.BlameStatus) int {
+	n := 0
+	for _, st := range statuses {
+		n += counts[st]
+	}
+	return n
+}
+
+// BlameList handles GET /blame. ?status= picks a filter (default "active").
 func (h *Handler) BlameList(w http.ResponseWriter, r *http.Request) {
-	edges, err := h.store.RecentBlameEdges(r.Context(), 50)
+	selected := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("status")))
+	if selected == "" {
+		selected = "active"
+	}
+	statuses, err := models.ParseBlameStatuses(selected)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	counts, err := h.store.BlameStatusCounts(r.Context())
+	if err != nil {
+		http.Error(w, "counting blame edges", http.StatusInternalServerError)
+		return
+	}
+	edges, err := h.store.ListBlameEdges(r.Context(), models.BlameEdgeFilter{Statuses: statuses, Limit: blameListLimit})
 	if err != nil {
 		http.Error(w, "fetching blame edges", http.StatusInternalServerError)
 		return
 	}
-	h.templates.renderPage(w, "blame_list.html", blameListData{pageBase: h.base("blame"), Edges: edges})
+
+	tabs := make([]tab, 0, len(blameTabs))
+	for _, t := range blameTabs {
+		ts, _ := models.ParseBlameStatuses(t.Value)
+		tabs = append(tabs, tab{Label: t.Label, Href: "/blame?status=" + t.Value, Count: countStatuses(counts, ts), Active: t.Value == selected})
+	}
+	h.templates.renderPage(w, "blame_list.html", blameListData{
+		pageBase: h.base("blame"), Edges: edges, Tabs: tabs, Selected: selected, Matching: countStatuses(counts, statuses),
+	})
 }
 
 // blameDetailData backs templates/pages/blame_detail.html.
@@ -146,17 +194,131 @@ func (h *Handler) Setup(w http.ResponseWriter, r *http.Request) {
 // anomaliesData backs templates/pages/anomalies.html.
 type anomaliesData struct {
 	pageBase
-	Anomalies []models.CostSnapshot
+	Anomalies []models.AnomalySummary
+	Tabs      []tab
+	Selected  string
+	Matching  int
 }
 
-// AnomalyList handles GET /anomalies.
+// anomalyTabs lists the state filters, in the order a reader triages them.
+// "candidates" are anomalies where deploys were found but none was confident
+// enough to alert: they used to vanish from every list.
+var anomalyTabs = []struct {
+	Value, Label string
+	State        models.AnomalyState
+}{
+	{"all", "All", ""},
+	{"candidates", "Candidates", models.AnomalyStateCandidates},
+	{"resolved", "Resolved", models.AnomalyStateResolved},
+	{"unblamed", "Unblamed", models.AnomalyStateUnblamed},
+	{"confirmed", "Confirmed", models.AnomalyStateConfirmed},
+	{"dismissed", "Dismissed", models.AnomalyStateDismissed},
+}
+
+// AnomalyList handles GET /anomalies. ?state= picks a filter (default "all").
 func (h *Handler) AnomalyList(w http.ResponseWriter, r *http.Request) {
-	anomalies, err := h.store.UnblamedAnomalies(r.Context())
+	selected := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("state")))
+	if selected == "" {
+		selected = "all"
+	}
+	var states []models.AnomalyState
+	if selected != "all" {
+		parsed, err := models.ParseAnomalyStates(selected)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		states = parsed
+	}
+
+	counts, err := h.store.AnomalyStateCounts(r.Context())
+	if err != nil {
+		http.Error(w, "counting anomalies", http.StatusInternalServerError)
+		return
+	}
+	anomalies, err := h.store.ListAnomalies(r.Context(), models.AnomalyFilter{States: states, Limit: anomalyListLimit})
 	if err != nil {
 		http.Error(w, "fetching anomalies", http.StatusInternalServerError)
 		return
 	}
-	h.templates.renderPage(w, "anomalies.html", anomaliesData{pageBase: h.base("anomalies"), Anomalies: anomalies})
+
+	total := 0
+	for _, n := range counts {
+		total += n
+	}
+	matching := total
+	tabs := make([]tab, 0, len(anomalyTabs))
+	for _, t := range anomalyTabs {
+		n := total
+		if t.State != "" {
+			n = counts[t.State]
+		}
+		tabs = append(tabs, tab{Label: t.Label, Href: "/anomalies?state=" + t.Value, Count: n, Active: t.Value == selected})
+		if t.Value == selected {
+			matching = n
+		}
+	}
+	h.templates.renderPage(w, "anomalies.html", anomaliesData{
+		pageBase: h.base("anomalies"), Anomalies: anomalies, Tabs: tabs, Selected: selected, Matching: matching,
+	})
+}
+
+// anomalyDetailData backs templates/pages/anomaly_detail.html.
+type anomalyDetailData struct {
+	pageBase
+	Anomaly *models.CostSnapshot
+	State   models.AnomalyState
+	Counts  models.EdgeCounts
+	Edges   []models.BlameEdge // every candidate, best first
+	History []models.CostSnapshot
+}
+
+// AnomalyDetail handles GET /anomalies/{id}: the anomaly, how it stands, and
+// every candidate deploy ranked by confidence with confirm/dismiss on each.
+// This is where an anomaly with only low-confidence candidates can be reviewed.
+func (h *Handler) AnomalyDetail(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "invalid anomaly ID", http.StatusBadRequest)
+		return
+	}
+	snap, err := h.store.CostSnapshotByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "fetching anomaly", http.StatusInternalServerError)
+		return
+	}
+	edges, err := h.store.BlameEdgesBySnapshot(r.Context(), id)
+	if err != nil {
+		http.Error(w, "fetching candidates", http.StatusInternalServerError)
+		return
+	}
+
+	var counts models.EdgeCounts
+	for _, e := range edges {
+		switch e.Status {
+		case models.BlameStatusPending:
+			counts.Pending++
+		case models.BlameStatusResolved:
+			counts.Resolved++
+		case models.BlameStatusConfirmed:
+			counts.Confirmed++
+		case models.BlameStatusDismissed:
+			counts.Dismissed++
+		}
+	}
+
+	history, err := h.store.CostSnapshotsByService(r.Context(), snap.Service, snap.PeriodStart.Add(-costHistoryLookback), snap.PeriodEnd)
+	if err != nil {
+		slog.Warn("web: fetching cost history for the anomaly chart", "service", snap.Service, "err", err)
+	}
+
+	h.templates.renderPage(w, "anomaly_detail.html", anomalyDetailData{
+		pageBase: h.base("anomalies"), Anomaly: snap, State: models.StateOf(counts), Counts: counts, Edges: edges, History: history,
+	})
 }
 
 // ConfirmBlame handles POST /blame/{id}/confirm.
