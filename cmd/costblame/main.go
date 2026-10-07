@@ -32,6 +32,7 @@ import (
 	webhooknotify "github.com/prem0x01/costblame/internal/notify/webhook"
 	sqlitestore "github.com/prem0x01/costblame/internal/store/sqlite"
 	"github.com/prem0x01/costblame/internal/tui"
+	"github.com/prem0x01/costblame/internal/version"
 	"github.com/prem0x01/costblame/internal/web"
 )
 
@@ -43,6 +44,8 @@ func main() {
 		Short: "Correlate cloud cost spikes with the deployments that caused them",
 	}
 
+	root.Version = version.Get().Version
+	root.SetVersionTemplate("{{.Name}} {{.Version}}\n")
 	root.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "config file (default: costblame.yaml)")
 
 	root.AddCommand(
@@ -50,10 +53,23 @@ func main() {
 		migrateCmd(),
 		reportCmd(),
 		tuiCmd(),
+		versionCmd(),
 	)
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
+	}
+}
+
+// versionCmd prints the build's version, commit and platform.
+func versionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print the version, commit and platform of this build",
+		Args:  cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Fprintln(cmd.OutOrStdout(), version.Get())
+		},
 	}
 }
 
